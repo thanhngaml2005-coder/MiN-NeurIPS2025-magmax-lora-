@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.95)
+        self._network.collect_projections(mode='threshold', val=0.9)
         
         
         self._clear_gpu()
@@ -315,7 +315,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.85
+        current_scale = 0.8
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
@@ -341,7 +341,7 @@ class MinNet(object):
             kl_losses = 0.0 # Theo dõi riêng KL
             correct, total = 0, 0
 
-            beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
+            beta_current = max_beta * min(1.0, epoch / (epochs / 3 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
