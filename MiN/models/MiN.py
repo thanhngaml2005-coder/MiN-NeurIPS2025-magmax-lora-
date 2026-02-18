@@ -310,6 +310,107 @@ class MinNet(object):
         print(f"--> Refitting Task {self.cur_task} (No Augmentation)...")
         self.fit_fc(train_loader, test_loader)
        
+    # def run(self, train_loader):
+    #     epochs = self.init_epochs if self.cur_task == 0 else self.epochs
+    #     lr = self.init_lr if self.cur_task == 0 else self.lr
+    #     weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
+
+    #     current_scale = 0.85
+        
+    #     # Freeze/Unfreeze Logic
+    #     for param in self._network.parameters(): param.requires_grad = False
+    #     for param in self._network.normal_fc.parameters(): param.requires_grad = True
+        
+    #     if self.cur_task == 0: self._network.init_unfreeze()
+    #     else: self._network.unfreeze_noise()
+            
+    #     params = filter(lambda p: p.requires_grad, self._network.parameters())
+    #     optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
+    #     scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
+
+    #     prog_bar = tqdm(range(epochs))
+    #     self._network.train()
+    #     self._network.to(self.device)
+
+    #     WARMUP_EPOCHS = 2
+    #     max_beta = 5e-5
+    #     for _, epoch in enumerate(prog_bar):
+    #         losses = 0.0
+    #         ce_losses = 0.0 # Theo dõi riêng CE
+    #         kl_losses = 0.0 # Theo dõi riêng KL
+    #         correct, total = 0, 0
+
+    #         beta_current = max_beta 
+
+    #         for i, (_, inputs, targets) in enumerate(train_loader):
+    #             inputs = inputs.to(self.device)
+    #             targets = targets.to(self.device)
+                
+    #             optimizer.zero_grad(set_to_none=True) 
+
+    #             # 1. FORWARD
+    #             with autocast('cuda'):
+    #                 if self.cur_task > 0:
+    #                     with torch.no_grad():
+    #                         logits1 = self._network(inputs, new_forward=False)['logits']
+    #                     logits2, batch_kl = self._network.forward_with_ib(inputs)
+    #                     logits_final = logits2 + logits1
+    #                 else:
+    #                     logits_final, batch_kl = self._network.forward_with_ib(inputs)
+
+    #             # 2. CALC LOSS
+    #             logits_final = logits_final.float() 
+    #             if targets.dim() > 1: targets = targets.reshape(-1)
+    #             targets = targets.long()
+
+    #             ce_loss = F.cross_entropy(logits_final, targets)
+    #             loss = ce_loss + beta_current * batch_kl
+
+    #             # 3. BACKWARD
+    #             self.scaler.scale(loss).backward()
+                
+    #             if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
+    #                 self.scaler.unscale_(optimizer)
+    #                 self._network.apply_gpm_to_grads(scale=current_scale)
+                
+    #             self.scaler.step(optimizer)
+    #             self.scaler.update()
+                
+    #             # 4. METRICS & LOGGING
+    #             losses += loss.item()
+    #             ce_losses += ce_loss.item()      # Cộng dồn CE
+    #             kl_losses += batch_kl.item()     # Cộng dồn KL
+                
+    #             _, preds = torch.max(logits_final, dim=1)
+    #             correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+    #             total += len(targets)
+                
+    #             del inputs, targets, loss, logits_final, batch_kl
+
+    #             # In bảng Noise mỗi 50 batch
+    #             if i % 50 == 0:
+    #                  if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
+    #                     self.print_noise_status()
+
+    #         scheduler.step()
+    #         train_acc = 100. * correct / total
+
+    #         # [HIỂN THỊ CHI TIẾT LOSS]
+    #         # L: Tổng | CE: CrossEntropy (Dự đoán) | KL: IB Loss (Nén)
+    #         info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+    #             self.cur_task, epoch + 1, 
+    #             losses / len(train_loader), 
+    #             ce_losses / len(train_loader),
+    #             kl_losses / len(train_loader),
+    #             train_acc
+    #         )
+    #         self.logger.info(info)
+    #         prog_bar.set_description(info)
+            
+    #         if epoch % 5 == 0:
+    #             self._clear_gpu()
+    
+    # gradient 2 tp vuông góc 
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
@@ -317,15 +418,16 @@ class MinNet(object):
 
         current_scale = 0.85
         
-        # Freeze/Unfreeze Logic
+        # --- Freeze/Unfreeze Logic ---
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
         if self.cur_task == 0: self._network.init_unfreeze()
         else: self._network.unfreeze_noise()
             
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
+        # Lọc ra các params thực sự cần train để tối ưu vòng lặp
+        trainable_params = [p for p in self._network.parameters() if p.requires_grad]
+        optimizer = get_optimizer(self.args['optimizer_type'], trainable_params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
         prog_bar = tqdm(range(epochs))
@@ -333,13 +435,15 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 5e-5
+        max_beta = 5e-5 # Hoặc 1e-5 tùy config
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
-            ce_losses = 0.0 # Theo dõi riêng CE
-            kl_losses = 0.0 # Theo dõi riêng KL
+            ce_losses = 0.0
+            kl_losses = 0.0
             correct, total = 0, 0
 
+            # Logic Beta Warmup (nếu muốn dùng, ở đây để max_beta mặc định)
             beta_current = max_beta 
 
             for i, (_, inputs, targets) in enumerate(train_loader):
@@ -358,17 +462,77 @@ class MinNet(object):
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                # 2. CALC LOSS
                 logits_final = logits_final.float() 
                 if targets.dim() > 1: targets = targets.reshape(-1)
                 targets = targets.long()
 
+                # 2. TÁCH RIÊNG 2 LOẠI LOSS
                 ce_loss = F.cross_entropy(logits_final, targets)
-                loss = ce_loss + beta_current * batch_kl
+                kl_loss = beta_current * batch_kl
 
-                # 3. BACKWARD
-                self.scaler.scale(loss).backward()
+                # -----------------------------------------------------------
+                # 3. GRADIENT SURGERY (PCGrad Logic)
+                # -----------------------------------------------------------
                 
+                # B3.1: Tính Gradient cho CE Loss
+                # retain_graph=True để giữ lại đồ thị cho lần backward sau (KL)
+                self.scaler.scale(ce_loss).backward(retain_graph=True)
+                
+                # Lưu lại grad của CE và xóa khỏi param để tính tiếp KL
+                grads_ce = []
+                for p in trainable_params:
+                    if p.grad is not None:
+                        grads_ce.append(p.grad.clone())
+                        p.grad = None # Reset ngay để tính cái tiếp theo
+                    else:
+                        grads_ce.append(torch.zeros_like(p))
+
+                # B3.2: Tính Gradient cho KL Loss
+                self.scaler.scale(kl_loss).backward() # Không cần retain nữa
+                
+                grads_kl = []
+                for p in trainable_params:
+                    if p.grad is not None:
+                        grads_kl.append(p.grad.clone())
+                        p.grad = None
+                    else:
+                        grads_kl.append(torch.zeros_like(p))
+
+                # B3.3: Phẫu thuật (Chiếu Gradient)
+                with torch.no_grad():
+                    # Làm phẳng (Flatten) để tính dot product
+                    g1_flat = torch.cat([g.view(-1) for g in grads_ce])
+                    g2_flat = torch.cat([g.view(-1) for g in grads_kl])
+                    
+                    dot_product = torch.dot(g1_flat, g2_flat)
+                    
+                    if dot_product < 0:
+                        # Xung đột phát hiện! (Góc > 90 độ)
+                        # Chiếu CE lên mặt phẳng vuông góc với KL
+                        norm_kl = torch.dot(g2_flat, g2_flat)
+                        if norm_kl > 1e-8:
+                            scale_ce = dot_product / norm_kl
+                            for j in range(len(grads_ce)):
+                                grads_ce[j] -= scale_ce * grads_kl[j]
+                        
+                        # Chiếu KL lên mặt phẳng vuông góc với CE
+                        norm_ce = torch.dot(g1_flat, g1_flat)
+                        if norm_ce > 1e-8:
+                            scale_kl = dot_product / norm_ce
+                            for j in range(len(grads_kl)):
+                                grads_kl[j] -= scale_kl * grads_ce_orig[j] # Lưu ý: Dùng bản gốc của CE nếu làm chuẩn
+                                # Nhưng để tiết kiệm VRAM và đơn giản, ta chấp nhận xấp xỉ hoặc chỉ sửa 1 chiều
+                                # Ở đây tôi sửa cả 2 theo công thức PCGrad đơn giản hóa:
+                                grads_kl[j] -= scale_kl * grads_ce[j] # (Xấp xỉ)
+
+                # B3.4: Gán lại Gradient đã sửa vào Model
+                for j, p in enumerate(trainable_params):
+                    # Cộng dồn 2 vector đã được chỉnh hướng
+                    p.grad = grads_ce[j] + grads_kl[j]
+
+                # -----------------------------------------------------------
+                # 4. GPM PROTECTION (Giữ nguyên logic cũ)
+                # -----------------------------------------------------------
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
                     self.scaler.unscale_(optimizer)
                     self._network.apply_gpm_to_grads(scale=current_scale)
@@ -376,16 +540,18 @@ class MinNet(object):
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
-                # 4. METRICS & LOGGING
-                losses += loss.item()
-                ce_losses += ce_loss.item()      # Cộng dồn CE
-                kl_losses += batch_kl.item()     # Cộng dồn KL
+                # 5. METRICS & LOGGING
+                loss_val = ce_loss.item() + kl_loss.item() # Chỉ để hiển thị
+                losses += loss_val
+                ce_losses += ce_loss.item()
+                kl_losses += batch_kl.item()
                 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                del inputs, targets, loss, logits_final, batch_kl
+                # Clean memory
+                del inputs, targets, logits_final, batch_kl, grads_ce, grads_kl
 
                 # In bảng Noise mỗi 50 batch
                 if i % 50 == 0:
@@ -395,8 +561,6 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            # [HIỂN THỊ CHI TIẾT LOSS]
-            # L: Tổng | CE: CrossEntropy (Dự đoán) | KL: IB Loss (Nén)
             info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
                 self.cur_task, epoch + 1, 
                 losses / len(train_loader), 
@@ -409,8 +573,6 @@ class MinNet(object):
             
             if epoch % 5 == 0:
                 self._clear_gpu()
-    
-    
     def print_noise_status(self):
         print("\n" + "="*85)
         print(f"{'Layer':<10} | {'Signal':<10} | {'Noise':<10} | {'SNR':<10} | {'Sigma':<10} | {'Scale':<10} | {'Status'}")
