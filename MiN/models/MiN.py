@@ -415,18 +415,29 @@ class MinNet(object):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
-
         current_scale = 0.85
         
-        # --- Freeze/Unfreeze Logic ---
-        for param in self._network.parameters(): param.requires_grad = False
-        for param in self._network.normal_fc.parameters(): param.requires_grad = True
+        # --- [FIX 1] FORCE UNFREEZE LOGIC ---
+        # Đảm bảo chắc chắn params được set đúng
+        for param in self._network.parameters(): 
+            param.requires_grad = False # Freeze All Backbone
         
-        if self.cur_task == 0: self._network.init_unfreeze()
-        else: self._network.unfreeze_noise()
+        # Unfreeze Classifier
+        for param in self._network.normal_fc.parameters(): 
+            param.requires_grad = True
+        
+        # Unfreeze Noise (Quan trọng)
+        if self.cur_task == 0: 
+            self._network.init_unfreeze()
+        else: 
+            self._network.unfreeze_noise()
             
-        # Lọc ra các params thực sự cần train để tối ưu vòng lặp
+        # Kiểm tra xem có param nào được train không
         trainable_params = [p for p in self._network.parameters() if p.requires_grad]
+        print(f"--> [DEBUG] Total Trainable Params: {len(trainable_params)}")
+        if len(trainable_params) == 0:
+            print("--> [WARNING] No parameters to train! Check unfreeze logic.")
+
         optimizer = get_optimizer(self.args['optimizer_type'], trainable_params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
@@ -435,7 +446,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 5e-5 # Hoặc 1e-5 tùy config
+        max_beta = 1e-5 
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
@@ -443,12 +454,18 @@ class MinNet(object):
             kl_losses = 0.0
             correct, total = 0, 0
 
-            # Logic Beta Warmup (nếu muốn dùng, ở đây để max_beta mặc định)
-            beta_current = max_beta 
+            # Logic Beta Warmup (Task > 0 thả lỏng 5 epoch đầu)
+            if self.cur_task > 0:
+                if epoch < 5: 
+                    beta_current = 0.0 # Tắt nén để học nhanh
+                else:
+                    progress = (epoch - 5) / (epochs - 5)
+                    beta_current = max_beta * progress
+            else:
+                beta_current = max_beta
 
             for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
                 optimizer.zero_grad(set_to_none=True) 
 
@@ -466,76 +483,72 @@ class MinNet(object):
                 if targets.dim() > 1: targets = targets.reshape(-1)
                 targets = targets.long()
 
-                # 2. TÁCH RIÊNG 2 LOẠI LOSS
+                # 2. TÁCH LOSS
                 ce_loss = F.cross_entropy(logits_final, targets)
                 kl_loss = beta_current * batch_kl
 
                 # -----------------------------------------------------------
-                # 3. GRADIENT SURGERY (PCGrad Logic)
+                # 3. BACKWARD VỚI SAFE GUARD (Chống Crash)
                 # -----------------------------------------------------------
                 
-                # B3.1: Tính Gradient cho CE Loss
-                # retain_graph=True để giữ lại đồ thị cho lần backward sau (KL)
+                # B3.1: CE Backward (Luôn có grad)
                 self.scaler.scale(ce_loss).backward(retain_graph=True)
                 
-                # Lưu lại grad của CE và xóa khỏi param để tính tiếp KL
+                # Lưu grads CE
                 grads_ce = []
                 for p in trainable_params:
                     if p.grad is not None:
                         grads_ce.append(p.grad.clone())
-                        p.grad = None # Reset ngay để tính cái tiếp theo
+                        p.grad = None 
                     else:
                         grads_ce.append(torch.zeros_like(p))
 
-                # B3.2: Tính Gradient cho KL Loss
-                self.scaler.scale(kl_loss).backward() # Không cần retain nữa
+                # B3.2: KL Backward (Chỉ chạy khi có grad)
+                # [FIX 2] Kiểm tra requires_grad để tránh lỗi RuntimeError
+                if kl_loss.requires_grad and beta_current > 0:
+                    self.scaler.scale(kl_loss).backward()
+                    
+                    grads_kl = []
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            grads_kl.append(p.grad.clone())
+                            p.grad = None
+                        else:
+                            grads_kl.append(torch.zeros_like(p))
+                    
+                    # B3.3: PCGrad Projection (Nếu có KL grad)
+                    with torch.no_grad():
+                        g1_flat = torch.cat([g.view(-1) for g in grads_ce])
+                        g2_flat = torch.cat([g.view(-1) for g in grads_kl])
+                        
+                        dot_product = torch.dot(g1_flat, g2_flat)
+                        
+                        if dot_product < 0:
+                            # Xung đột! Chiếu CE lên vuông góc KL
+                            norm_kl = torch.dot(g2_flat, g2_flat)
+                            if norm_kl > 1e-8:
+                                scale_ce = dot_product / norm_kl
+                                for j in range(len(grads_ce)):
+                                    grads_ce[j] -= scale_ce * grads_kl[j]
+                            
+                            # Chiếu KL lên vuông góc CE
+                            norm_ce = torch.dot(g1_flat, g1_flat)
+                            if norm_ce > 1e-8:
+                                scale_kl = dot_product / norm_ce
+                                for j in range(len(grads_kl)):
+                                    # [FIX 3] Dùng grads_ce hiện tại (xấp xỉ) để tránh lỗi NameError
+                                    grads_kl[j] -= scale_kl * grads_ce[j] 
+
+                    # Cộng dồn gradient cuối cùng
+                    for j, p in enumerate(trainable_params):
+                        p.grad = grads_ce[j] + grads_kl[j]
                 
-                grads_kl = []
-                for p in trainable_params:
-                    if p.grad is not None:
-                        grads_kl.append(p.grad.clone())
-                        p.grad = None
-                    else:
-                        grads_kl.append(torch.zeros_like(p))
+                else:
+                    # Nếu KL không có grad (do beta=0 hoặc lỗi), chỉ dùng CE
+                    for j, p in enumerate(trainable_params):
+                        p.grad = grads_ce[j]
 
-                # B3.3: Phẫu thuật (Chiếu Gradient)
-                with torch.no_grad():
-                    # Làm phẳng (Flatten) để tính dot product
-                    g1_flat = torch.cat([g.view(-1) for g in grads_ce])
-                    g2_flat = torch.cat([g.view(-1) for g in grads_kl])
-                    
-                    dot_product = torch.dot(g1_flat, g2_flat)
-                    
-                    # ... (Phần tính dot_product giữ nguyên)
-                
-                if dot_product < 0:
-                    # Xung đột phát hiện! (Góc > 90 độ)
-                    
-                    # 1. Chiếu CE lên mặt phẳng vuông góc với KL
-                    norm_kl = torch.dot(g2_flat, g2_flat)
-                    if norm_kl > 1e-8:
-                        scale_ce = dot_product / norm_kl
-                        for j in range(len(grads_ce)):
-                            grads_ce[j] -= scale_ce * grads_kl[j]
-                    
-                    # 2. Chiếu KL lên mặt phẳng vuông góc với CE
-                    norm_ce = torch.dot(g1_flat, g1_flat)
-                    if norm_ce > 1e-8:
-                        scale_kl = dot_product / norm_ce
-                        for j in range(len(grads_kl)):
-                            # [SỬA LỖI TẠI ĐÂY]
-                            # Thay vì dùng grads_ce_orig (chưa định nghĩa), ta dùng grads_ce hiện tại
-                            # Điều này chấp nhận sai số nhỏ nhưng chạy được và tiết kiệm VRAM
-                            grads_kl[j] -= scale_kl * grads_ce[j]
-
-                # B3.4: Gán lại Gradient đã sửa vào Model
-                for j, p in enumerate(trainable_params):
-                    # Cộng dồn 2 vector đã được chỉnh hướng
-                    p.grad = grads_ce[j] + grads_kl[j]
-
-                # -----------------------------------------------------------
-                # 4. GPM PROTECTION (Giữ nguyên logic cũ)
-                # -----------------------------------------------------------
+                # 4. GPM Protection
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
                     self.scaler.unscale_(optimizer)
                     self._network.apply_gpm_to_grads(scale=current_scale)
@@ -543,8 +556,8 @@ class MinNet(object):
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
-                # 5. METRICS & LOGGING
-                loss_val = ce_loss.item() + kl_loss.item() # Chỉ để hiển thị
+                # Metrics
+                loss_val = ce_loss.item() + kl_loss.item()
                 losses += loss_val
                 ce_losses += ce_loss.item()
                 kl_losses += batch_kl.item()
@@ -553,29 +566,25 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                # Clean memory
-                del inputs, targets, logits_final, batch_kl, grads_ce, grads_kl
-
-                # In bảng Noise mỗi 50 batch
-                if i % 50 == 0:
-                     if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
-                        self.print_noise_status()
+                # In thông báo Noise (ít lại để đỡ spam)
+                if i == 0 and epoch % 5 == 0: 
+                     if self.cur_task > 0: self.print_noise_status()
 
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+            info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f} | B {:.1e}".format(
                 self.cur_task, epoch + 1, 
                 losses / len(train_loader), 
                 ce_losses / len(train_loader),
                 kl_losses / len(train_loader),
-                train_acc
+                train_acc, beta_current
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
-            if epoch % 5 == 0:
-                self._clear_gpu()
+            if epoch % 5 == 0: self._clear_gpu()
+    
     def print_noise_status(self):
         print("\n" + "="*85)
         print(f"{'Layer':<10} | {'Signal':<10} | {'Noise':<10} | {'SNR':<10} | {'Sigma':<10} | {'Scale':<10} | {'Status'}")
