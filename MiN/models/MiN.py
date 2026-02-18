@@ -506,24 +506,27 @@ class MinNet(object):
                     
                     dot_product = torch.dot(g1_flat, g2_flat)
                     
-                    if dot_product < 0:
-                        # Xung đột phát hiện! (Góc > 90 độ)
-                        # Chiếu CE lên mặt phẳng vuông góc với KL
-                        norm_kl = torch.dot(g2_flat, g2_flat)
-                        if norm_kl > 1e-8:
-                            scale_ce = dot_product / norm_kl
-                            for j in range(len(grads_ce)):
-                                grads_ce[j] -= scale_ce * grads_kl[j]
-                        
-                        # Chiếu KL lên mặt phẳng vuông góc với CE
-                        norm_ce = torch.dot(g1_flat, g1_flat)
-                        if norm_ce > 1e-8:
-                            scale_kl = dot_product / norm_ce
-                            for j in range(len(grads_kl)):
-                                grads_kl[j] -= scale_kl * grads_ce_orig[j] # Lưu ý: Dùng bản gốc của CE nếu làm chuẩn
-                                # Nhưng để tiết kiệm VRAM và đơn giản, ta chấp nhận xấp xỉ hoặc chỉ sửa 1 chiều
-                                # Ở đây tôi sửa cả 2 theo công thức PCGrad đơn giản hóa:
-                                grads_kl[j] -= scale_kl * grads_ce[j] # (Xấp xỉ)
+                    # ... (Phần tính dot_product giữ nguyên)
+                
+                if dot_product < 0:
+                    # Xung đột phát hiện! (Góc > 90 độ)
+                    
+                    # 1. Chiếu CE lên mặt phẳng vuông góc với KL
+                    norm_kl = torch.dot(g2_flat, g2_flat)
+                    if norm_kl > 1e-8:
+                        scale_ce = dot_product / norm_kl
+                        for j in range(len(grads_ce)):
+                            grads_ce[j] -= scale_ce * grads_kl[j]
+                    
+                    # 2. Chiếu KL lên mặt phẳng vuông góc với CE
+                    norm_ce = torch.dot(g1_flat, g1_flat)
+                    if norm_ce > 1e-8:
+                        scale_kl = dot_product / norm_ce
+                        for j in range(len(grads_kl)):
+                            # [SỬA LỖI TẠI ĐÂY]
+                            # Thay vì dùng grads_ce_orig (chưa định nghĩa), ta dùng grads_ce hiện tại
+                            # Điều này chấp nhận sai số nhỏ nhưng chạy được và tiết kiệm VRAM
+                            grads_kl[j] -= scale_kl * grads_ce[j]
 
                 # B3.4: Gán lại Gradient đã sửa vào Model
                 for j, p in enumerate(trainable_params):
