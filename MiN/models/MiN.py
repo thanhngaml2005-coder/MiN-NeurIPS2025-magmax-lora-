@@ -334,7 +334,7 @@ class MinNet(object):
 
         # Cài đặt số epoch học tự do
         WARMUP_EPOCHS = 3 # Gợi ý: Nên để 3-5 epoch cho 20 tasks
-        max_beta = 1e-4
+        max_beta = 1e-5
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
