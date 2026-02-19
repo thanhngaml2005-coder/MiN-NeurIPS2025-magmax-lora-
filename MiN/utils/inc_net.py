@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from sklearn.metrics import accuracy_score
 from tqdm import tqdm
 from torch import nn, Tensor
+import gc
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear

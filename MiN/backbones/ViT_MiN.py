@@ -26,6 +26,7 @@ Hacked together by / Copyright 2020, Ross Wightman
 import copy
 import logging
 import math
+import gc
 from collections import OrderedDict
 from functools import partial
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple, Type, Union, List
