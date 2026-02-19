@@ -315,7 +315,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.6
+        current_scale = 0.7
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
@@ -332,15 +332,25 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        WARMUP_EPOCHS = 2
+        # Cài đặt số epoch học tự do
+        WARMUP_EPOCHS = 3 # Gợi ý: Nên để 3-5 epoch cho 20 tasks
         max_beta = 1e-4
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             ce_losses = 0.0 # Theo dõi riêng CE
             kl_losses = 0.0 # Theo dõi riêng KL
             correct, total = 0, 0
 
-            beta_current = max_beta 
+            # -----------------------------------------------------------------
+            # [LOGIC MỚI]: Bật/Tắt chế độ học tự do (Warm-up)
+            # -----------------------------------------------------------------
+            if epoch < WARMUP_EPOCHS:
+                beta_current = 0.0  # Tắt VIB, chỉ dùng Cross-Entropy
+                is_warmup = True
+            else:
+                beta_current = max_beta # Bật lại VIB
+                is_warmup = False
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
@@ -364,12 +374,15 @@ class MinNet(object):
                 targets = targets.long()
 
                 ce_loss = F.cross_entropy(logits_final, targets)
+                
+                # Nếu beta_current = 0.0, loss sẽ chỉ bằng ce_loss
                 loss = ce_loss + beta_current * batch_kl
 
                 # 3. BACKWARD
                 self.scaler.scale(loss).backward()
                 
-                if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
+                # TẮT GPM TRONG LÚC WARM-UP, CHỈ BẬT KHI ĐÃ HẾT WARM-UP
+                if self.cur_task > 0 and not is_warmup:
                     self.scaler.unscale_(optimizer)
                     self._network.apply_gpm_to_grads(scale=current_scale)
                 
@@ -378,8 +391,8 @@ class MinNet(object):
                 
                 # 4. METRICS & LOGGING
                 losses += loss.item()
-                ce_losses += ce_loss.item()      # Cộng dồn CE
-                kl_losses += batch_kl.item()     # Cộng dồn KL
+                ce_losses += ce_loss.item()      
+                kl_losses += batch_kl.item()     
                 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
@@ -395,10 +408,10 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            # [HIỂN THỊ CHI TIẾT LOSS]
-            # L: Tổng | CE: CrossEntropy (Dự đoán) | KL: IB Loss (Nén)
-            info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
-                self.cur_task, epoch + 1, 
+            # [HIỂN THỊ CHI TIẾT LOSS & TRẠNG THÁI]
+            stage = "FREE" if is_warmup else "LOCK"
+            info = "T {} | Ep {} [{}] | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, stage,
                 losses / len(train_loader), 
                 ce_losses / len(train_loader),
                 kl_losses / len(train_loader),
@@ -409,7 +422,6 @@ class MinNet(object):
             
             if epoch % 5 == 0:
                 self._clear_gpu()
-    
     
     def print_noise_status(self):
         print("\n" + "="*85)
