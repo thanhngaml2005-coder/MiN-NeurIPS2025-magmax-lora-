@@ -60,6 +60,48 @@ class Noise_weigh(nn.Module):
 
     def forward(self, x):
         return x * self.weight
+class ROGOLinear(nn.Linear):
+    """Bản sao chuẩn xác của class Linear trong ROGO paper"""
+    def __init__(self, in_features, out_features, bias=True):
+        super(ROGOLinear, self).__init__(in_features, out_features, bias=bias)
+        scale = self.weight.data.new(in_features, in_features).fill_(0.)
+        scale.fill_diagonal_(1.)
+        self.scale = nn.Parameter(scale, requires_grad=True)
+        self.identity = None # Cache cho hàm Loss Phạt
+
+    def forward(self, input, space=None):
+        if space is not None and space.shape[1] > 0:
+            sz = self.weight.size(0)
+            real_scale = self.scale[:space.size(1), :space.size(1)]
+            norm_project = torch.mm(torch.mm(space, real_scale), space.transpose(1, 0))
+            proj_weight = torch.mm(self.weight.view(sz, -1), norm_project).view(self.weight.size())
+            diag_weight = torch.mm(self.weight.view(sz, -1), torch.mm(space, space.transpose(1,0))).view(self.weight.size())
+            masked_weight = proj_weight + self.weight - diag_weight
+        else:
+            masked_weight = self.weight
+        return F.linear(input, masked_weight, self.bias)
+
+    def consolidate(self, space=None):
+        if space is not None and space.shape[1] > 0:
+            sz = self.weight.size(0)
+            real_scale = self.scale[:space.size(1), :space.size(1)].float()
+            norm_project = torch.mm(torch.mm(space, real_scale), space.transpose(1, 0))
+            proj_weight = torch.mm(self.weight.view(sz, -1), norm_project).view(self.weight.size())
+            diag_weight = torch.mm(self.weight.view(sz, -1), torch.mm(space, space.transpose(1,0))).view(self.weight.size())
+            masked_weight = proj_weight + self.weight - diag_weight
+            self.weight.data = masked_weight.data
+            
+        self.scale.data.fill_(0.)
+        self.scale.data.fill_diagonal_(1.)
+
+    def get_penalty(self, space=None):
+        """Tính || Scale - I ||^2 để chống Forgetting"""
+        if space is not None and space.shape[1] > 0:
+            if self.identity is None or self.identity.shape[0] != space.shape[1]:
+                self.identity = torch.eye(space.shape[1], device=self.scale.device)
+            real_scale = self.scale[:space.size(1), :space.size(1)]
+            return torch.sum((real_scale - self.identity) ** 2)
+        return torch.tensor(0.0, device=self.weight.device)
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
@@ -90,9 +132,12 @@ class PiNoise(nn.Module):
         
         self.feature_cache = [] 
         self.is_caching = False
-        self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
-        
+        # [SỬA ĐỔI 1]: DÙNG ROGO LINEAR CHO FC_MU VÀ FC_RHO
+        self.fc_mu = ROGOLinear(hidden_dim, hidden_dim)
+        self.fc_rho = ROGOLinear(hidden_dim, hidden_dim)
+        # Không gian V của ROGO
+        self.relax_V_mu = None
+        self.relax_V_rho = None
         # [AN TOÀN 1] Khởi tạo Bias âm để Sigma bắt đầu cực nhỏ
         # Softplus(-5) ~= 0.006. Nhiễu khởi đầu gần như bằng 0.
         nn.init.constant_(self.fc_rho.weight, 0.)
@@ -105,8 +150,7 @@ class PiNoise(nn.Module):
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
         self.noise_scale = nn.Parameter(torch.tensor(0.1))
         self.last_debug_info = {}
-        self.last_gpm_ratio = 1.0
-
+     
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
@@ -163,11 +207,11 @@ class PiNoise(nn.Module):
         
         x_down = hyper_features @ self.w_down
         if not self.training and self.is_caching:
-            # Bắt buộc detach() và .cpu() để không bị tràn VRAM (OOM)
             self.feature_cache.append(x_down.detach().cpu())
-        # 2. Variational Encoding
-        mu = self.fc_mu(x_down)
-        sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
+            
+        # [SỬA ĐỔI 2]: TRUYỀN KHÔNG GIAN V VÀO LINEAR
+        mu = self.fc_mu(x_down, space=self.relax_V_mu)
+        sigma = F.softplus(self.fc_rho(x_down, space=self.relax_V_rho)) + 1e-6 
         
         if self.training:
             epsilon = torch.randn_like(sigma)
@@ -175,22 +219,18 @@ class PiNoise(nn.Module):
         else:
             z = mu 
         
-        # 3. Noise Injection
         noise_projected = z @ self.w_up
         effective_noise = self.noise_scale * noise_projected
         out = hyper_features + effective_noise
+        
         if self.training:
             with torch.no_grad():
-                sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
-                noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
-                
                 self.last_debug_info = {
-                    "signal": sig_norm,
-                    "noise": noise_norm,
-                    "snr": sig_norm / (noise_norm + 1e-9),
+                    "signal": hyper_features.norm(p=2, dim=-1).mean().item(),
+                    "noise": effective_noise.norm(p=2, dim=-1).mean().item(),
+                    "snr": hyper_features.norm(p=2, dim=-1).mean().item() / (effective_noise.norm(p=2, dim=-1).mean().item() + 1e-9),
                     "sigma": sigma.mean().item(),
-                    "scale": self.noise_scale.item(),
-                    "gpm_ratio": self.last_gpm_ratio # Tích hợp GPM info
+                    "scale": self.noise_scale.item()
                 }
                 
         if return_kl:
@@ -198,38 +238,94 @@ class PiNoise(nn.Module):
             return out, kl_div.mean()
         else:
             return out
-
-
-    def apply_gradient_projection(self, scale=1.0):
+    
+    # [THUẬT TOÁN ROGO]: TÌM KHÔNG GIAN NỚI LỎNG V BÊN TRONG U
+    def update_relaxing_space(self):
         if self.core_U.shape[1] == 0: return
         
+        def find_V(grad, U_core):
+            thresholds = 0.97
+            space_thresholds = 0.90
+            frozen_space = U_core.clone()
+            current_grad = grad.t() 
+            
+            U, S, _ = torch.linalg.svd(current_grad, full_matrices=False)
+            sval_ratio = (S**2) / (S**2).sum()
+            r = 1
+            while torch.sum(sval_ratio[:r]) < thresholds and r < len(S): r += 1
+            U_grad = U[:, :r]
+            
+            UU = U_grad @ U_grad.t()
+            trusts = []
+            importance = 0
+            
+            while importance < space_thresholds and frozen_space.shape[1] > 0:
+                representation = frozen_space.t() @ UU @ frozen_space
+                try:
+                    Ux, Sx, _ = torch.linalg.svd(representation, full_matrices=False)
+                    x = Ux[:, 0:1]
+                except:
+                    break
+                
+                if torch.sum(x) == 0: break
+                u = frozen_space @ x
+                u /= torch.linalg.norm(u)
+                
+                replace = False
+                for idx in range(len(x)):
+                    if x[idx] != 0:
+                        if idx > 0 and idx < len(x) - 1:
+                            frozen_space = torch.cat([u, frozen_space[:, :idx], frozen_space[:, idx+1:]], dim=1)
+                        elif idx == 0:
+                            frozen_space = torch.cat([u, frozen_space[:, 1:]], dim=1)
+                        else:
+                            frozen_space = torch.cat([u, frozen_space[:, :idx]], dim=1)
+                        replace = True
+                        break
+                if not replace: break
+                
+                q, _ = torch.linalg.qr(frozen_space)
+                trust = q[:, 0:1]
+                projection = UU @ trust
+                score = torch.linalg.norm(projection) / (torch.linalg.norm(trust) + 1e-9)
+                if score < space_thresholds: break
+                
+                frozen_space = q[:, 1:]
+                trusts.append(trust)
+            
+            if len(trusts) > 0: return torch.cat(trusts, dim=1)
+            return None
+
+        # Tính V dựa trên Gradient của Warm-up
+        if self.fc_mu.weight.grad is not None:
+            self.relax_V_mu = find_V(self.fc_mu.weight.grad.data.detach(), self.core_U)
+        if self.fc_rho.weight.grad is not None:
+            self.relax_V_rho = find_V(self.fc_rho.weight.grad.data.detach(), self.core_U)
+            
+        r_mu = self.relax_V_mu.shape[1] if self.relax_V_mu is not None else 0
+        r_rho = self.relax_V_rho.shape[1] if self.relax_V_rho is not None else 0
+        print(f"ROGO Space Found: V_mu={r_mu}, V_rho={r_rho} (In Core_U={self.core_U.shape[1]})")
+
+    def apply_gradient_projection(self):
+        """CHIẾU TRỰC GIAO TUYỆT ĐỐI LÊN U_CORE (SCALE = 1.0)"""
+        if self.core_U.shape[1] == 0: return
         with torch.no_grad():
             U = self.core_U 
-            ratios = []
+            def project_grad(layer):
+                if layer.weight.grad is not None:
+                    g = layer.weight.grad
+                    g_proj = (g @ U) @ U.t()
+                    layer.weight.grad -= g_proj # Tước đoạt 100% gradient vi phạm
             
-            def project_grad(weight):
-                if weight.grad is not None:
-                    g_norm_before = weight.grad.norm().item()
-                    g_inner = weight.grad @ U 
-                    g_proj = g_inner @ U.t()
-                    weight.grad -= (g_proj * scale)
-                    g_norm_after = weight.grad.norm().item()
-                    
-                    if g_norm_before > 0:
-                        ratios.append(g_norm_after / g_norm_before)
-            
-            project_grad(self.mu.weight)
-            project_grad(self.sigma.weight)
-            
-            # Lưu tỷ lệ trung bình để hiển thị ra bảng
-            if ratios: self.last_gpm_ratio = sum(ratios) / len(ratios)
-        
+            project_grad(self.fc_mu)
+            project_grad(self.fc_rho)
+            project_grad(self.mu)
+            project_grad(self.sigma)
+
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         if not self.feature_cache: return
-        
         device = 'cpu' 
         correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
-        
         for batch in self.feature_cache:
             b = batch.to(device)
             if b.dim() > 2: b = b.reshape(-1, b.shape[-1])
@@ -252,7 +348,6 @@ class PiNoise(nn.Module):
         else: 
             k = max(1, int(self.hidden_dim * val))
 
-        # Margin an toàn
         MARGIN = 20 
         MAX_ALLOWED_RANK = self.hidden_dim - MARGIN 
         k = min(k, MAX_ALLOWED_RANK)
@@ -266,9 +361,7 @@ class PiNoise(nn.Module):
             U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
             final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
             self.core_U = U_final[:, :final_k]
-
         print(f"--> GPM Core Rank Updated: {self.core_U.shape[1]} / {self.hidden_dim}")
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 

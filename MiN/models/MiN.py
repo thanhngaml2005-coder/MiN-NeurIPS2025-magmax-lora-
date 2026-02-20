@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(train_loader, mode='threshold', val=0.6)
+        self._network.collect_projections(train_loader, mode='threshold', val=0.85)
         
         
         self._clear_gpu()
@@ -201,13 +201,18 @@ class MinNet(object):
         
         self._clear_gpu()
         self.run(train_loader_sgd)
-        TOTAL_TASKS = 10
-        base_val = 0.95
-        min_val = 0.80
-        dynamic_val = base_val - (self.cur_task / TOTAL_TASKS) * (base_val - min_val)
         
-        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.6)
-        
+        # [ROGO CONSOLIDATE]: Nướng trọng số scale vào weight và reset
+        print("--> Consolidating ROGO Spaces...")
+        for j in range(self._network.backbone.layer_num):
+            layer = self._network.backbone.noise_maker[j]
+            layer.fc_mu.consolidate(layer.relax_V_mu)
+            layer.fc_rho.consolidate(layer.relax_V_rho)
+            layer.relax_V_mu = None
+            layer.relax_V_rho = None
+            
+        # Thu thập GPM
+        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.85)        
         self._clear_gpu()
 
         del train_set
@@ -319,14 +324,13 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.9
-        
-        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
-        if self.cur_task == 0: self._network.init_unfreeze()
-        else: self._network.unfreeze_noise()
+        if self.cur_task == 0: 
+            self._network.init_unfreeze()
+        else: 
+            self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
@@ -336,25 +340,33 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        # Cài đặt số epoch học tự do
-        WARMUP_EPOCHS = 3 # Gợi ý: Nên để 3-5 epoch cho 20 tasks
+        WARMUP_EPOCHS = 3 
         max_beta = 1e-5
+        rogo_weight = 1.0 # Trọng số Penalty \beta của ROGO
+
+        # [FIX 3]: Cờ kiểm soát việc tìm không gian ROGO
+        rogo_space_initialized = False
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
-            ce_losses = 0.0 # Theo dõi riêng CE
-            kl_losses = 0.0 # Theo dõi riêng KL
+            ce_losses = 0.0 
+            kl_losses = 0.0 
             correct, total = 0, 0
 
-            # -----------------------------------------------------------------
-            # [LOGIC MỚI]: Bật/Tắt chế độ học tự do (Warm-up)
-            # -----------------------------------------------------------------
-            if epoch < WARMUP_EPOCHS:
-                beta_current = 0.0  # Tắt VIB, chỉ dùng Cross-Entropy
+            # Điều phối Warm-up
+            if self.cur_task > 0 and epoch < WARMUP_EPOCHS:
+                beta_current = 0.0  
                 is_warmup = True
             else:
-                beta_current = max_beta # Bật lại VIB
+                beta_current = max_beta 
                 is_warmup = False
+
+            # [FIX 3]: THỰC HIỆN TÌM KHÔNG GIAN V NGAY KHI VỪA HẾT WARMUP
+            if self.cur_task > 0 and not is_warmup and not rogo_space_initialized:
+                print("\n--> END OF WARMUP: Computing ROGO Relaxing Spaces...")
+                for j in range(self._network.backbone.layer_num):
+                    self._network.backbone.noise_maker[j].update_relaxing_space()
+                rogo_space_initialized = True
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
@@ -362,7 +374,6 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True) 
 
-                # 1. FORWARD
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
@@ -372,28 +383,35 @@ class MinNet(object):
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                # 2. CALC LOSS
                 logits_final = logits_final.float() 
                 if targets.dim() > 1: targets = targets.reshape(-1)
                 targets = targets.long()
 
                 ce_loss = F.cross_entropy(logits_final, targets)
                 
-                # Nếu beta_current = 0.0, loss sẽ chỉ bằng ce_loss
-                loss = ce_loss + beta_current * batch_kl
+                # [FIX 1]: TÍNH LOSS PHẠT ROGO ĐÚNG CÁCH
+                # Chỉ tính khi không gian V đã được thiết lập
+                rogo_penalty = torch.tensor(0.0, device=self.device)
+                if not is_warmup and self.cur_task > 0 and rogo_space_initialized:
+                    for j in range(self._network.backbone.layer_num):
+                        layer = self._network.backbone.noise_maker[j]
+                        rogo_penalty += layer.fc_mu.get_penalty(layer.relax_V_mu)
+                        rogo_penalty += layer.fc_rho.get_penalty(layer.relax_V_rho)
+                        
+                loss = ce_loss + beta_current * batch_kl + rogo_weight * rogo_penalty
 
-                # 3. BACKWARD
                 self.scaler.scale(loss).backward()
                 
-                # TẮT GPM TRONG LÚC WARM-UP, CHỈ BẬT KHI ĐÃ HẾT WARM-UP
+                # [FIX 2]: CHIẾU GPM
+                # GPM Cắt đứt 100% gradient lấn vào U_core đối với các trọng số GỐC
                 if self.cur_task > 0 and not is_warmup:
                     self.scaler.unscale_(optimizer)
-                    self._network.apply_gpm_to_grads(scale=current_scale)
+                    self._network.apply_gpm_to_grads()
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
-                # 4. METRICS & LOGGING
+                # METRICS & LOGGING
                 losses += loss.item()
                 ce_losses += ce_loss.item()      
                 kl_losses += batch_kl.item()     
@@ -402,9 +420,8 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                del inputs, targets, loss, logits_final, batch_kl
+                del inputs, targets, loss, logits_final, batch_kl, rogo_penalty
 
-                # In bảng Noise mỗi 50 batch
                 if i % 50 == 0:
                      if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
                         self.print_noise_status()
@@ -412,8 +429,7 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            # [HIỂN THỊ CHI TIẾT LOSS & TRẠNG THÁI]
-            stage = "FREE" if is_warmup else "LOCK"
+            stage = "FREE" if is_warmup else "ROGO"
             info = "T {} | Ep {} [{}] | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
                 self.cur_task, epoch + 1, stage,
                 losses / len(train_loader), 
