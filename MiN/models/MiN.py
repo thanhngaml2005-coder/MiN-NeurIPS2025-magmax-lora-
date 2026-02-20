@@ -315,7 +315,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.6
+        current_scale = 0.5
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
