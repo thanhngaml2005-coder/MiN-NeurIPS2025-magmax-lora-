@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(train_loader, mode='threshold', val=0.85)
+        self._network.collect_projections(train_loader, mode='threshold', val=0.5)
         
         
         self._clear_gpu()
@@ -212,7 +212,7 @@ class MinNet(object):
             layer.relax_V_rho = None
             
         # Thu thập GPM
-        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.85)        
+        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.5)        
         self._clear_gpu()
 
         del train_set
