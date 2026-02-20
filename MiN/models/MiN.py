@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        #self._network.collect_projections(train_loader, mode='threshold', val=0.95)
+        self._network.collect_projections(train_loader, mode='threshold', val=0.7)
         
         
         self._clear_gpu()
@@ -203,7 +203,7 @@ class MinNet(object):
         self.run(train_loader_sgd)
         
         # Thu thập GPM Projection sau khi train xong noise
-        #self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.95)
+        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.95)
         self._clear_gpu()
 
         del train_set
@@ -315,7 +315,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.5
+        current_scale = 0.99
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
@@ -382,9 +382,9 @@ class MinNet(object):
                 self.scaler.scale(loss).backward()
                 
                 # TẮT GPM TRONG LÚC WARM-UP, CHỈ BẬT KHI ĐÃ HẾT WARM-UP
-                # if self.cur_task > 0 and not is_warmup:
-                #     self.scaler.unscale_(optimizer)
-                #     self._network.apply_gpm_to_grads(scale=current_scale)
+                if self.cur_task > 0 and not is_warmup:
+                    self.scaler.unscale_(optimizer)
+                    self._network.apply_gpm_to_grads(scale=current_scale)
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()

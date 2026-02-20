@@ -170,6 +170,7 @@ class MiNbaseNet(nn.Module):
                 
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
+
     # =========================================================================
     # [ANALYTIC LEARNING (RLS) SECTION]
     # =========================================================================
