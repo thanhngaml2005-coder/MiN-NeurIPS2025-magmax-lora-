@@ -135,7 +135,6 @@ class PiNoise(nn.Module):
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
         
         self.feature_cache = [] 
-        self.is_caching = False
         self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
         self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
         
@@ -164,8 +163,6 @@ class PiNoise(nn.Module):
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-        # self.w_down.requires_grad = False
-        # self.w_up.requires_grad = False
         self.w_down.requires_grad = True
         self.w_up.requires_grad = True
 
@@ -205,11 +202,8 @@ class PiNoise(nn.Module):
 
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
-        
         x_down = hyper_features @ self.w_down
-        # if not self.training and self.is_caching:
-        #     # Bắt buộc detach() và .cpu() để không bị tràn VRAM (OOM)
-        #     self.feature_cache.append(x_down.detach().cpu())
+        
         # 2. Variational Encoding
         mu = self.fc_mu(x_down)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
@@ -276,7 +270,6 @@ class PiNoise(nn.Module):
         """
         if not self.feature_cache: return
         
-        
         device = 'cpu' # Tiết kiệm VRAM tối đa
         correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
         
@@ -340,8 +333,6 @@ class PiNoise(nn.Module):
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
-
 
 
 

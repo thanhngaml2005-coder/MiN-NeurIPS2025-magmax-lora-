@@ -3,13 +3,7 @@ import logging
 import math
 import numpy as np
 import torch
-import torch.nn as nn
-from torch import Tensor
-from torch.nn import functional as F
-from sklearn.metrics import accuracy_score
-from tqdm import tqdm
 from torch import nn, Tensor
-import gc
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
@@ -214,30 +208,13 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    # Trong file MiNbaseNet (hoặc file chứa hàm này)
-    
-    def collect_projections(self, dataloader, mode='threshold', val=0.95):
+    def collect_projections(self, mode='threshold', val=0.95):
         """
-        [SỬA LẠI]: Nhận thêm dataloader để chạy 1 vòng thu thập feature.
+        Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
         """
         print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
-        
-        # 1. BẬT cờ thu thập cho tất cả các lớp PiNoise
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].is_caching = True
-            
-        # 2. CHẠY FORWARD để tích lũy feature vào cache
-        self.eval() # Chuyển sang eval mode
-        with torch.no_grad(), autocast(enabled=False): # Tắt autocast để feature chuẩn FP32
-            for _, inputs, _ in tqdm(dataloader, desc="Caching Features"):
-                inputs = inputs.float().to(self.device)
-                # Chỉ cần gọi forward, PiNoise sẽ tự động append x_down vào feature_cache
-                _ = self.backbone(inputs) 
-                
-        # 3. TÍNH TOÁN SVD và TẮT cờ thu thập
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
-            self.backbone.noise_maker[j].is_caching = False # Quan trọng: Tắt đi kẻo tràn RAM
     def apply_gpm_to_grads(self, scale=1.0):
         """
         Thực hiện chiếu trực giao gradient cho mu và sigma.
@@ -411,5 +388,3 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
-    # gọi magmax ở class Pinoise trong file Vit_MiN.py
-    
