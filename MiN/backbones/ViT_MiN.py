@@ -207,9 +207,9 @@ class PiNoise(nn.Module):
         # 1. Down Projection
         
         x_down = hyper_features @ self.w_down
-        if not self.training and self.is_caching:
-            # Bắt buộc detach() và .cpu() để không bị tràn VRAM (OOM)
-            self.feature_cache.append(x_down.detach().cpu())
+        # if not self.training and self.is_caching:
+        #     # Bắt buộc detach() và .cpu() để không bị tràn VRAM (OOM)
+        #     self.feature_cache.append(x_down.detach().cpu())
         # 2. Variational Encoding
         mu = self.fc_mu(x_down)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
@@ -340,6 +340,8 @@ class PiNoise(nn.Module):
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
+
+
 
 
 

@@ -411,3 +411,5 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
+    # gọi magmax ở class Pinoise trong file Vit_MiN.py
+    

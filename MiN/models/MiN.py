@@ -136,7 +136,11 @@ class MinNet(object):
         
         self.run(train_loader)
         #self._network.collect_projections(train_loader, mode='threshold', val=0.95)
-        
+        # gọi apply_magmax ở đây
+        print("--> Saving MagMax Snapshot for Task 0...")
+        for j in range(self._network.backbone.layer_num):
+            self._network.backbone.noise_maker[j].after_task_training()
+
         
         self._clear_gpu()
         
@@ -162,69 +166,97 @@ class MinNet(object):
         del train_set, test_set
         self._clear_gpu()
 
-    def increment_train(self, data_manger):
-        self.cur_task += 1
-        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
+    def run(self, train_loader):
+        epochs = self.init_epochs if self.cur_task == 0 else self.epochs
+        lr = self.init_lr if self.cur_task == 0 else self.lr
+        weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        train_set = data_manger.get_task_data(source="train", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-        self.test_loader = test_loader
-
-        # [FIX 1: QUAN TRỌNG] Phải update FC (mở rộng class) TRƯỚC KHI fit
-        # Để fit_fc biết được đúng số lượng class mới
-        self._network.update_fc(self.increment)
+        for param in self._network.parameters(): param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
-        # Update Noise Generator cho task mới
-        self._network.update_noise()
+        if self.cur_task == 0: self._network.init_unfreeze()
+        else: self._network.unfreeze_noise()
+            
+        params = filter(lambda p: p.requires_grad, self._network.parameters())
+        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
+        scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
-        # [STEP 1] Analytic Learning (RLS)
-        # Fit trên dữ liệu task mới (đồng thời tích lũy vào bộ nhớ A_global, B_global)
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-        
-        self.fit_fc(train_loader, test_loader)
+        prog_bar = tqdm(range(epochs))
+        self._network.train()
+        self._network.to(self.device)
 
-        # [STEP 2] Training Noise (SGD)
-        # Tạo lại loader với batch_size nhỏ hơn cho việc train noise
-        train_loader_sgd = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                        num_workers=self.num_workers)
-        
-        self._clear_gpu()
-        self.run(train_loader_sgd)
-        
-        # Thu thập GPM Projection sau khi train xong noise
-        #self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.95)
-        self._clear_gpu()
+        # Warm-up Beta vẫn được giữ để VIB hội tụ tốt, nhưng KHÔNG CÓ GPM hay ROGO
+        WARMUP_EPOCHS = 3 
+        max_beta = 1e-4 # Có thể để cao hơn một chút vì không bị GPM/ROGO bóp nghẹt
 
-        del train_set
+        for _, epoch in enumerate(prog_bar):
+            losses = 0.0
+            ce_losses = 0.0 
+            kl_losses = 0.0 
+            correct, total = 0, 0
 
-        # [STEP 3] Re-Fit Analytic Classifier (Final Polish)
-        # Dùng tập train không augmentation để chốt hạ classifier
-        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        
-        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
-                                         num_workers=self.num_workers)
+            # Điều phối VIB Beta
+            if epoch < WARMUP_EPOCHS:
+                beta_current = 0.0  
+                stage = "FREE-CE"
+            else:
+                beta_current = max_beta 
+                stage = "VIB-ON"
 
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                optimizer.zero_grad(set_to_none=True) 
 
-        self.re_fit(train_loader_no_aug, test_loader)
-        
-        del train_set_no_aug, test_set
-        self._clear_gpu()
+                with autocast('cuda'):
+                    if self.cur_task > 0:
+                        with torch.no_grad():
+                            logits1 = self._network(inputs, new_forward=False)['logits']
+                        logits2, batch_kl = self._network.forward_with_ib(inputs)
+                        logits_final = logits2 + logits1
+                    else:
+                        logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
+                logits_final = logits_final.float() 
+                if targets.dim() > 1: targets = targets.reshape(-1)
+                targets = targets.long()
+
+                ce_loss = F.cross_entropy(logits_final, targets)
+                loss = ce_loss + beta_current * batch_kl
+
+                # Backward bình thường, KHÔNG CÓ CHIẾU GPM
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                
+                losses += loss.item()
+                ce_losses += ce_loss.item()      
+                kl_losses += batch_kl.item()     
+                
+                _, preds = torch.max(logits_final, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+                
+                del inputs, targets, loss, logits_final, batch_kl
+
+                if i == len(train_loader) - 1 and epoch % 5 == 0:
+                     if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
+                        self.print_noise_status() # Lưu ý: sửa hàm in xóa bỏ cột gpm_ratio nhé
+
+            scheduler.step()
+            train_acc = 100. * correct / total
+
+            info = "T {} | Ep {} [{}] | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, stage,
+                losses / len(train_loader), 
+                ce_losses / len(train_loader),
+                kl_losses / len(train_loader),
+                train_acc
+            )
+            self.logger.info(info)
+            prog_bar.set_description(info)
+            
+            if epoch % 5 == 0:
+                self._clear_gpu()
     def fit_fc(self, train_loader, test_loader):
         # [FIX 2: MEMORY ACCUMULATION]
         # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
@@ -315,7 +347,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.5
+        current_scale = 0.6
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
@@ -382,9 +414,9 @@ class MinNet(object):
                 self.scaler.scale(loss).backward()
                 
                 # TẮT GPM TRONG LÚC WARM-UP, CHỈ BẬT KHI ĐÃ HẾT WARM-UP
-                # if self.cur_task > 0 and not is_warmup:
-                #     self.scaler.unscale_(optimizer)
-                #     self._network.apply_gpm_to_grads(scale=current_scale)
+                if self.cur_task > 0 and not is_warmup:
+                    self.scaler.unscale_(optimizer)
+                    self._network.apply_gpm_to_grads(scale=current_scale)
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()
