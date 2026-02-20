@@ -105,6 +105,7 @@ class PiNoise(nn.Module):
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
         self.noise_scale = nn.Parameter(torch.tensor(0.1))
         self.last_debug_info = {}
+        self.last_gpm_ratio = 1.0
 
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
@@ -180,7 +181,6 @@ class PiNoise(nn.Module):
         out = hyper_features + effective_noise
         if self.training:
             with torch.no_grad():
-                # Tính norm trung bình trên chiều cuối cùng (dim=-1)
                 sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
                 noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
                 
@@ -189,21 +189,24 @@ class PiNoise(nn.Module):
                     "noise": noise_norm,
                     "snr": sig_norm / (noise_norm + 1e-9),
                     "sigma": sigma.mean().item(),
-                    "scale": self.noise_scale.item()
+                    "scale": self.noise_scale.item(),
+                    "gpm_ratio": self.last_gpm_ratio # Tích hợp GPM info
                 }
-        # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
+                
         if return_kl:
             kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
             return out, kl_div.mean()
         else:
-            # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
             return out
-    
+
+
     def apply_gradient_projection(self, scale=1.0):
         if self.core_U.shape[1] == 0: return
         
         with torch.no_grad():
             U = self.core_U 
+            ratios = []
+            
             def project_grad(weight):
                 if weight.grad is not None:
                     g_norm_before = weight.grad.norm().item()
@@ -211,25 +214,20 @@ class PiNoise(nn.Module):
                     g_proj = g_inner @ U.t()
                     weight.grad -= (g_proj * scale)
                     g_norm_after = weight.grad.norm().item()
-                    # In ra tỷ lệ còn lại
-                    ratio = g_norm_after / (g_norm_before + 1e-9)
-                    print(f"GPM: grad retained {ratio*100:.1f}%")
+                    
+                    if g_norm_before > 0:
+                        ratios.append(g_norm_after / g_norm_before)
             
             project_grad(self.mu.weight)
             project_grad(self.sigma.weight)
-        
+            
+            # Lưu tỷ lệ trung bình để hiển thị ra bảng
+            if ratios: self.last_gpm_ratio = sum(ratios) / len(ratios)
         
     def compute_projection_matrix(self, mode='threshold', val=0.95):
-        """
-        Tính SVD trên Covariance Matrix.
-        Args:
-            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
-            val: Epsilon hoặc Ratio tương ứng.
-        """
         if not self.feature_cache: return
         
-        
-        device = 'cpu' # Tiết kiệm VRAM tối đa
+        device = 'cpu' 
         correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
         
         for batch in self.feature_cache:
@@ -241,44 +239,24 @@ class PiNoise(nn.Module):
         self.feature_cache = []
         gc.collect()
 
-        # 2. SVD
         try:
             U, S, _ = torch.linalg.svd(correlation_matrix)
         except:
             U, S, _ = torch.svd(correlation_matrix)
         
-        # 3. CHỌN K
-        if mode == 'eigenvalue':
-            max_s = S[0]
-            if max_s == 0: k = 0
-            else:
-                relative_S = S / max_s
-                k = (relative_S > val).sum().item()
-            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
-
-        elif mode == 'threshold':
+        if mode == 'threshold':
             total_var = torch.sum(S)
             s_cumsum = torch.cumsum(S, dim=0)
             k = torch.searchsorted(s_cumsum, total_var * val).item()
             if k == 0 and total_var > 0: k = 1
-            print(f"--> GPM Selection (Energy {val*100}%): Need {k} dims.", flush=True)
-            
-        else: # ratio
+        else: 
             k = max(1, int(self.hidden_dim * val))
-            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
 
-        # =================================================================
-        # 4. SAFETY MARGIN (BẮT BUỘC)
-        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
-        # dù Core Space đã đầy.
-        # =================================================================
-        MARGIN = 12 
-        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
-        
-        # Cắt bớt nếu vượt quá trần
+        # Margin an toàn
+        MARGIN = 20 
+        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN 
         k = min(k, MAX_ALLOWED_RANK)
         
-        # 5. Update Memory
         U_new = U[:, :k+1].to(self.core_U.device)
 
         if self.core_U.shape[1] == 0:
@@ -286,15 +264,10 @@ class PiNoise(nn.Module):
         else:
             combined = torch.cat([self.core_U, U_new], dim=1)
             U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
-            
-            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
             final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
             self.core_U = U_final[:, :final_k]
 
-        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
-
-
+        print(f"--> GPM Core Rank Updated: {self.core_U.shape[1]} / {self.hidden_dim}")
 
 class Attention(nn.Module):
     fused_attn: Final[bool]

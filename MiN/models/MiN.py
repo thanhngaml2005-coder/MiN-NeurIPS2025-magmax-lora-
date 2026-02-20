@@ -201,7 +201,12 @@ class MinNet(object):
         
         self._clear_gpu()
         self.run(train_loader_sgd)
+        TOTAL_TASKS = 10
+        base_val = 0.95
+        min_val = 0.80
+        dynamic_val = base_val - (self.cur_task / TOTAL_TASKS) * (base_val - min_val)
         
+        self._network.collect_projections(train_loader_sgd, mode='threshold', val=dynamic_val)
         # Thu thập GPM Projection sau khi train xong noise
         self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.95)
         self._clear_gpu()
@@ -315,7 +320,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.99
+        current_scale = 0.7
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
