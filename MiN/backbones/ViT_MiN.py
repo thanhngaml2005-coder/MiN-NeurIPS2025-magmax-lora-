@@ -97,11 +97,13 @@ class PiNoise(nn.Module):
         
         # [AN TOÀN 1] Khởi tạo Bias âm để Sigma bắt đầu cực nhỏ
         # Softplus(-5) ~= 0.006. Nhiễu khởi đầu gần như bằng 0.
-        nn.init.constant_(self.fc_rho.weight, 0.)
-        nn.init.constant_(self.fc_rho.bias, -5.0) 
-        
-        nn.init.constant_(self.fc_mu.weight, 0.)
+        # Khởi tạo Mu với nhiễu cực nhỏ để mồi gradient
+        nn.init.normal_(self.fc_mu.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.fc_mu.bias, 0.)
+        
+        # Nâng Bias lên -3.0 để Sigma khởi đầu không bị quá "ngạt thở"
+        nn.init.normal_(self.fc_rho.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.fc_rho.bias, -3.0)
 
         # [AN TOÀN 2] Learnable Scaling Factor
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
@@ -112,11 +114,14 @@ class PiNoise(nn.Module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
     def reset_to_zero(self):
-        """BẮT BUỘC CHO MAGMAX: Đưa não bộ về 0 trước khi học Task mới để có Task Vector độc lập"""
-        nn.init.constant_(self.fc_rho.weight, 0.)
-        nn.init.constant_(self.fc_rho.bias, -5.0) 
-        nn.init.constant_(self.fc_mu.weight, 0.)
+        """BẮT BUỘC CHO MAGMAX: Đưa não bộ về 0 nhưng không được giết chết Neuron"""
+        # Khởi tạo Mu với nhiễu cực nhỏ thay vì 0 tuyệt đối để mồi gradient
+        nn.init.normal_(self.fc_mu.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.fc_mu.bias, 0.)
+        
+        # Sửa bias từ -5.0 thành -3.0 (Sigma bắt đầu ở ~0.04 thay vì 0.006)
+        nn.init.constant_(self.fc_rho.weight, 0.)
+        nn.init.constant_(self.fc_rho.bias, -3.0)
 
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
@@ -129,11 +134,15 @@ class PiNoise(nn.Module):
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
+   
     def unfreeze_incremental(self):
         """Task > 0: Train noise only"""
+        for param in self.parameters(): param.requires_grad = False
         self.update_noise()
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
+        # [THÊM DÒNG NÀY]: Cho phép van khuếch đại tự do điều chỉnh
+        self.noise_scale.requires_grad = True
 
     def after_task_training(self):
         # Snapshot đúng lớp đang dùng
