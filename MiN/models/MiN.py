@@ -191,11 +191,11 @@ class MinNet(object):
 
         # [STEP 1] Analytic Learning (RLS)
         # Fit trên dữ liệu task mới (đồng thời tích lũy vào bộ nhớ A_global, B_global)
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+        # if self.args['pretrained']:
+        #     for param in self._network.backbone.parameters():
+        #         param.requires_grad = False
         
-        self.fit_fc(train_loader, test_loader)
+        # self.fit_fc(train_loader, test_loader)
 
         # [STEP 2] Training Noise (SGD)
         # Tạo lại loader với batch_size nhỏ hơn cho việc train noise
@@ -365,7 +365,8 @@ class MinNet(object):
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
                         logits2, batch_kl = self._network.forward_with_ib(inputs)
-                        logits_final = logits2 + logits1
+                        logits_final = logits2 
+                        #logits_final = logits2 + logits1
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
