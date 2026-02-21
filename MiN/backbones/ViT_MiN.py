@@ -85,6 +85,7 @@ class PiNoise(nn.Module):
         # --- History for MagMax ---
         self.history_mu = []    
         self.history_sigma = [] 
+        self.history_rho = []
         
         # --- GPM Buffers ---
         # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
@@ -110,6 +111,12 @@ class PiNoise(nn.Module):
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
+    def reset_to_zero(self):
+        """BẮT BUỘC CHO MAGMAX: Đưa não bộ về 0 trước khi học Task mới để có Task Vector độc lập"""
+        nn.init.constant_(self.fc_rho.weight, 0.)
+        nn.init.constant_(self.fc_rho.bias, -5.0) 
+        nn.init.constant_(self.fc_mu.weight, 0.)
+        nn.init.constant_(self.fc_mu.bias, 0.)
 
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
@@ -129,14 +136,14 @@ class PiNoise(nn.Module):
         self.w_up.requires_grad = False
 
     def after_task_training(self):
-        # Snapshot
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        # Snapshot đúng lớp đang dùng
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.fc_mu.state_dict().items()}
+        rho_state = {k: v.detach().cpu().clone() for k, v in self.fc_rho.state_dict().items()}
         
         self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
+        self.history_rho.append(rho_state)
         
-        # MagMax Merge
+        # Gộp trọng số
         self._perform_magmax_merge()
 
     def _perform_magmax_merge(self):
@@ -153,9 +160,9 @@ class PiNoise(nn.Module):
                 merged_dict[key] = best_param.to(self.w_down.device)
             return merged_dict
 
-        self.mu.load_state_dict(get_merged_state(self.history_mu))
-        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
-
+        # [ĐÃ SỬA]: Load ngược lại vào đúng fc_mu và fc_rho
+        self.fc_mu.load_state_dict(get_merged_state(self.history_mu))
+        self.fc_rho.load_state_dict(get_merged_state(self.history_rho))
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
         x_down = hyper_features @ self.w_down

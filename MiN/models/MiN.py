@@ -135,6 +135,9 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
+        print("--> Saving MagMax Snapshot for Task 0...")
+        for j in range(self._network.backbone.layer_num):
+            self._network.backbone.noise_maker[j].after_task_training()
         self._network.collect_projections(mode='threshold', val=0.95)
         
         
@@ -200,7 +203,14 @@ class MinNet(object):
                                         num_workers=self.num_workers)
         
         self._clear_gpu()
+        print("--> Resetting Noise Modules for independent Task Vector...")
+        for j in range(self._network.backbone.layer_num):
+            self._network.backbone.noise_maker[j].reset_to_zero()
+        # ===============================================================
         self.run(train_loader_sgd)
+        print("--> Applying MagMax Merge...")
+        for j in range(self._network.backbone.layer_num):
+            self._network.backbone.noise_maker[j].after_task_training()
         
         # Thu thập GPM Projection sau khi train xong noise
         self._network.collect_projections(mode='threshold', val=0.95)
