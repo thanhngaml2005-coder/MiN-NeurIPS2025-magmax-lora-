@@ -381,10 +381,17 @@ class MinNet(object):
                 # 3. BACKWARD
                 self.scaler.scale(loss).backward()
                 
+                
+                if i == 0 and epoch == 0:
+                    print("\n=== GRADIENT CHECK (Task {}) ===".format(self.cur_task))
+                    for name, param in self._network.backbone.named_parameters():
+                        if 'fc_mu' in name or 'fc_rho' in name:
+                            has_grad = param.grad is not None and param.grad.abs().sum() > 0
+                            print(f"  {name}: requires_grad={param.requires_grad}, has_grad={has_grad}, "
+                                f"grad_norm={param.grad.norm().item() if param.grad is not None else 'None'}")
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
                     self.scaler.unscale_(optimizer)
                     self._network.apply_gpm_to_grads(scale=current_scale)
-                
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
