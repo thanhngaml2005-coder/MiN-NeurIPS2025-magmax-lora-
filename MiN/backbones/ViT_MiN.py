@@ -156,7 +156,17 @@ class PiNoise(nn.Module):
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
         if getattr(self, 'is_caching', False):
-            self.feature_cache.append(hyper_features.detach().cpu())
+            with torch.no_grad():
+                b = hyper_features.detach()
+                if b.dim() > 2: 
+                    b = b.reshape(-1, b.shape[-1])
+                
+                # Khởi tạo ma trận nếu chưa có
+                if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
+                    self.corr_matrix = torch.zeros((self.hidden_dim, self.hidden_dim), device=b.device)
+                
+                # Cộng dồn trực tiếp A = A + X^T @ X
+                self.corr_matrix += b.t() @ b
         x_down = hyper_features @ self.w_down
         
         # 2. Variational Encoding
@@ -219,24 +229,16 @@ class PiNoise(nn.Module):
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         """
-        Tính SVD trên Covariance Matrix.
-        Args:
-            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
-            val: Epsilon hoặc Ratio tương ứng.
+        Tính SVD trực tiếp từ ma trận cộng dồn, tốn 0 MB RAM.
         """
-        if not self.feature_cache: return
+        if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
+            return
         
-        device = 'cpu' # Tiết kiệm VRAM tối đa
-        correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
+        # Đưa ma trận hiệp phương sai (192x192) về CPU để tính SVD cho nhẹ
+        correlation_matrix = self.corr_matrix.cpu()
         
-        for batch in self.feature_cache:
-            b = batch.to(device)
-            if b.dim() > 2: b = b.reshape(-1, b.shape[-1])
-            correlation_matrix += b.t() @ b
-            del b
-            
-        self.feature_cache = []
-        gc.collect()
+        # Giải phóng bộ nhớ biến tích lũy để dùng cho Task sau
+        self.corr_matrix = None 
 
         # 2. SVD
         try:
@@ -265,14 +267,10 @@ class PiNoise(nn.Module):
             print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
 
         # =================================================================
-        # 4. SAFETY MARGIN (BẮT BUỘC)
-        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
-        # dù Core Space đã đầy.
+        # 4. SAFETY MARGIN
         # =================================================================
         MARGIN = 12 
         MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
-        
-        # Cắt bớt nếu vượt quá trần
         k = min(k, MAX_ALLOWED_RANK)
         
         # 5. Update Memory
@@ -283,12 +281,12 @@ class PiNoise(nn.Module):
         else:
             combined = torch.cat([self.core_U, U_new], dim=1)
             U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
-            
-            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
             final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
