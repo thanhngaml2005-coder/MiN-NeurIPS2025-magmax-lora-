@@ -99,7 +99,7 @@ class PiNoise(nn.Module):
         
         # [AN TOÀN 2] Learnable Scaling Factor
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
-        self.noise_scale = nn.Parameter(torch.tensor(0.2))
+        self.noise_scale = nn.Parameter(torch.tensor(0.1))
         self.last_debug_info = {}
 
     def _init_zero(self, module):

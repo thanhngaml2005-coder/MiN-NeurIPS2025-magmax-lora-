@@ -208,7 +208,7 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    def collect_projections(self, dataloader, mode='threshold', val=0.95):
+    def collect_projections(self, dataloader, mode='threshold', val=0.85):
         print("--> [GPM] Đang thu thập đặc trưng để tính SVD...")
         
         # 1. BẬT cờ cho phép thu thập (ở tất cả các block Noise)
