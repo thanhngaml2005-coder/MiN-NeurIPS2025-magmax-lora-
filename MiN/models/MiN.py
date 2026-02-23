@@ -135,7 +135,8 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projection()
+        self._network.collect_projections(dataloader=train_loader, mode='threshold')
+        self._network.snapshot_noise_weights()
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -202,7 +203,8 @@ class MinNet(object):
         self.run(train_loader_sgd)
         
         #collect projection
-        self._network.collect_projection()
+        self._network.collect_projections(dataloader=train_loader, mode='threshold')
+        self._network.snapshot_noise_weights()
         self._clear_gpu()
 
         del train_set
