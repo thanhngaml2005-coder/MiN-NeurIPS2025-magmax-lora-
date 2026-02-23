@@ -228,8 +228,9 @@ class PiNoise(nn.Module):
             k = min(k, MAX_ALLOWED_RANK)
             
             self.core_U = U[:, :k+1].to(self.core_U.device)
-            print(f"--> GPM Task 0: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
-
+            print(f"==> [CHECK GPM] Task 0 Finished:")
+            print(f"    - Core U Shape: {self.core_U.shape}") # Ví dụ: [192, 45]
+            print(f"    - Số chiều (Rank): {self.core_U.shape[1]}")
         else:
             U_old = self.core_U.cpu()
             P = U_old @ U_old.t()
