@@ -248,7 +248,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         max_beta = 1e-4 
-        lambda_ortho = 10000  # Hệ số phạt "khủng" của mày đây
+        lambda_ortho = 1e6 # Hệ số phạt "khủng" của mày đây
         
         prog_bar = tqdm(range(epochs))
         for _, epoch in enumerate(prog_bar):
