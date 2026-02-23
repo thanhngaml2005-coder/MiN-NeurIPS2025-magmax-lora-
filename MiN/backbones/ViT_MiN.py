@@ -156,12 +156,12 @@ class PiNoise(nn.Module):
     # 1. Kiểm tra xem đã có bộ nhớ GPM chưa
         if self.core_U.shape[1] == 0:
             # Nếu dòng này in ra ở Task 1, nghĩa là SVD Task 0 bị xịt
-            # print("DEBUG: core_U is EMPTY!") 
+            print("DEBUG: core_U is EMPTY!") 
             return torch.tensor(0.0, device=self.fc_mu.weight.device)
             
         if self.old_fc_mu_weight is None:
             # Nếu dòng này in ra, nghĩa là chưa gọi snapshot_noise_weights
-            # print("DEBUG: old_weight is NONE!")
+            print("DEBUG: old_weight is NONE!")
             return torch.tensor(0.0, device=self.fc_mu.weight.device)
         
         delta_W = self.fc_mu.weight - self.old_fc_mu_weight
