@@ -293,7 +293,7 @@ class MinNet(object):
                 # [NEW] CÁCH TÍNH SOFT ORTHOGONAL PENALTY
                 total_ortho_penalty = 0.0
                 if self.cur_task > 0:
-                    lambda_ortho = 500.0  # Hệ số phạt: Bác có thể tune (vd: 10, 100, 500)
+                    lambda_ortho = 10000  # Hệ số phạt: Bác có thể tune (vd: 10, 100, 500)
                     for block in self._network.backbone.noise_maker:
                         total_ortho_penalty += block.compute_soft_ortho_penalty()
                     
