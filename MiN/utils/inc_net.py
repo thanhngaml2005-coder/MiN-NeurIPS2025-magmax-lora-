@@ -211,30 +211,23 @@ class MiNbaseNet(nn.Module):
     
     def collect_projections(self, dataloader, mode='threshold'):
         print("--> [GPM] Đang thu thập đặc trưng để tính SVD...")
-        
-        # 1. BẬT cờ cho phép thu thập
-        for block in self.backbone.noise_maker: 
+        for block in self._network.backbone.noise_maker: 
             block.is_caching = True
             
-        # 2. CHẠY 1 VÒNG DATALOADER
-        self.eval()
+        self._network.eval()
         with torch.no_grad():
             for _, inputs, _ in dataloader:
                 inputs = inputs.to(self.device)
-                _ = self.forward(inputs) 
+                # PHẢI dùng forward_with_ib để dữ liệu chảy qua các khối PiNoise
+                _ = self._network.forward_with_ib(inputs) 
                 
-        # 3. TÍNH SVD THEO NGƯỠNG GIẢM DẦN & TẮT CỜ
-        num_layers = len(self.backbone.noise_maker)
-        for i, block in enumerate(self.backbone.noise_maker):
-            # Tự động tính val theo độ sâu của layer
+        # Sau vòng lặp này, các block.corr_matrix mới có dữ liệu để tính SVD
+        num_layers = len(self._network.backbone.noise_maker)
+        for i, block in enumerate(self._network.backbone.noise_maker):
             depth_ratio = i / max(1, (num_layers - 1))
             current_val = 0.99 - depth_ratio * (0.99 - 0.85)
-            
-            # Gọi tính SVD với current_val vừa tính
             block.compute_projection_matrix(mode=mode, val=current_val)
-            block.is_caching = False # Quan trọng: Phải tắt đi!
-    # (Giữ nguyên các hàm khởi tạo và forward cũ của bác trong MiNbaseNet)
-    
+            block.is_caching = False
     # [NEW] Thêm hàm này vào MiNbaseNet
     def snapshot_noise_weights(self):
         """Lưu lại trọng số cũ của các khối PiNoise để làm mốc tính Soft Penalty"""
