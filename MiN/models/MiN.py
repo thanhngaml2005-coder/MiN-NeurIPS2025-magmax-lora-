@@ -267,8 +267,10 @@ class MinNet(object):
                     block = self._network.backbone.noise_maker[0]
                     print(f"[RUN START] fc_mu requires_grad = {block.fc_mu.weight.requires_grad}")
                     print(f"[RUN START] fc_mu norm = {block.fc_mu.weight.norm().item():.6f}")
-                    print(f"[RUN START] old_weight norm = {block.old_fc_mu_weight.norm().item():.6f}")
-                                
+                    if block.old_fc_mu_weight is not None:
+                        print(f"[RUN START] old_weight norm = {block.old_fc_mu_weight.norm().item():.6f}")
+                    else:
+                        print(f"[RUN START] old_weight = None (Task 0, bình thường)")
                 optimizer.zero_grad(set_to_none=True) 
 
                 with autocast('cuda'):
