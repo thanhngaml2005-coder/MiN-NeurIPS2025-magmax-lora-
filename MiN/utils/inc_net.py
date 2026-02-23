@@ -233,12 +233,15 @@ class MiNbaseNet(nn.Module):
             # Gọi tính SVD với current_val vừa tính
             block.compute_projection_matrix(mode=mode, val=current_val)
             block.is_caching = False # Quan trọng: Phải tắt đi!
-    def apply_gpm_to_grads(self, scale=1.0):
-        """
-        Thực hiện chiếu trực giao gradient cho mu và sigma.
-        """
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+    # (Giữ nguyên các hàm khởi tạo và forward cũ của bác trong MiNbaseNet)
+    
+    # [NEW] Thêm hàm này vào MiNbaseNet
+    def snapshot_noise_weights(self):
+        """Lưu lại trọng số cũ của các khối PiNoise để làm mốc tính Soft Penalty"""
+        for block in self.backbone.noise_maker:
+            block.snapshot_old_weights()
+
+    # XÓA HÀM `apply_gpm_to_grads` ĐI (Không dùng nữa)
     def forward_with_ib(self, x):
         """
         [FIXED] Forward với IB, thêm logic lấy [CLS] token cho ViT.
