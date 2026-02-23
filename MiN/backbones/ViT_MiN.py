@@ -148,24 +148,51 @@ class PiNoise(nn.Module):
     def snapshot_old_weights(self):
         self.old_fc_mu_weight = self.fc_mu.weight.data.clone().detach().float()
         print(f"[SNAPSHOT] fc_mu weight norm = {self.old_fc_mu_weight.norm().item():.6f}")
-    # [NEW] Hàm tính Soft Orthogonal Penalty
+    #[NEW] Hàm tính Soft Orthogonal Penalty
+    # def compute_soft_ortho_penalty(self):
+    #     if self.core_U.shape[1] == 0:
+    #         print(f"[DEBUG] core_U empty → return 0")
+    #         return torch.tensor(0.0, device=self.fc_mu.weight.device)
+    #     if self.old_fc_mu_weight is None:
+    #         print(f"[DEBUG] old_fc_mu_weight is None → return 0")
+    #         return torch.tensor(0.0, device=self.fc_mu.weight.device)
+        
+    #     w_curr = self.fc_mu.weight.float()
+    #     w_old  = self.old_fc_mu_weight.to(w_curr.device).float()
+    #     delta_W = w_curr - w_old
+        
+    #     # CHIẾU
+    #     projection = delta_W @ self.core_U.float()
+        
+    #     # SỬA TẠI ĐÂY: Dùng Norm thay vì bình phương
+    #     # penalty = ||Delta W @ U||_F
+    #     penalty = torch.norm(projection) 
+    
+    # # In kiểu khoa học để soi số siêu bé
+    # # print(f"[DEBUG] delta_W norm: {delta_W.norm().item():.6f}")
+    # # print(f"[DEBUG] penalty: {penalty.item():.2e}") # e để hiện 1.23e-05
+    #     return penalty
+    #ko có u
     def compute_soft_ortho_penalty(self):
-        if self.core_U.shape[1] == 0:
-            print(f"[DEBUG] core_U empty → return 0")
-            return torch.tensor(0.0, device=self.fc_mu.weight.device)
+    # Nếu chưa có trọng số cũ (Task 0) thì không phạt
         if self.old_fc_mu_weight is None:
-            print(f"[DEBUG] old_fc_mu_weight is None → return 0")
             return torch.tensor(0.0, device=self.fc_mu.weight.device)
         
-        w_curr = self.fc_mu.weight.float()
-        w_old  = self.old_fc_mu_weight.to(w_curr.device).float()
-        delta_W = w_curr - w_old
+        # 1. Lấy trọng số hiện tại và trọng số cũ
+        w_curr = self.fc_mu.weight.float()  # Kích thước [Hidden, Hidden]
+        w_old  = self.old_fc_mu_weight.to(w_curr.device).float() # [Hidden, Hidden]
         
-        print(f"[DEBUG] delta_W norm: {delta_W.norm().item():.6f}, core_U rank: {self.core_U.shape[1]}")
+        # 2. Tính tích chéo (Dot product giữa các vector trọng số)
+        # Nếu w_curr và w_old trực giao, tích này phải xấp xỉ ma trận 0
+        dot_product = torch.matmul(w_curr, w_old.t())
         
-        projection = delta_W @ self.core_U.float()
-        penalty = projection.pow(2).sum() / self.core_U.shape[1]
-        print(f"[DEBUG] penalty: {penalty.item():.6f}")
+        # 3. Tính Frobenius Norm bình phương (Tổng bình phương các phần tử)
+        # Chia cho bình phương hidden_dim để chuẩn hóa scale (tránh loss quá to)
+        penalty = torch.sum(dot_product.pow(2)) / (self.hidden_dim ** 2)
+        
+        # Debug để bác theo dõi
+        # print(f"[DEBUG] Traditional Ortho Loss: {penalty.item():.6f}")
+        
         return penalty
 
     def forward(self, hyper_features, return_kl=False):
