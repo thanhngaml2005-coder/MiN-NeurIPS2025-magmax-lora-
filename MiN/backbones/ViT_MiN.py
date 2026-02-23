@@ -66,6 +66,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gc
+
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
@@ -80,51 +81,51 @@ class PiNoise(nn.Module):
         self.hidden_dim = hidden_dim
         
         # --- Trainable Parts (MagMax targets) ---
-        self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
-        self._init_zero(self.fc_mu)
-        nn.init.constant_(self.fc_rho.weight, 0.)
-        nn.init.constant_(self.fc_rho.bias, -5.0)
+        self.mu = nn.Linear(hidden_dim, hidden_dim)
+        self.sigma = nn.Linear(hidden_dim, hidden_dim)
+        self._init_zero(self.mu)
+        self._init_zero(self.sigma)
         
         # --- History for MagMax ---
         self.history_mu = []    
         self.history_sigma = [] 
         
         # --- GPM Buffers ---
+        # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
+        
         self.feature_cache = [] 
-        
-        # [NEW] Lưu trữ trọng số cũ để tính Soft Penalty
-        self.register_buffer('old_fc_mu_weight', None)
-        
-        # Learnable Scaling Factor
-        self.noise_scale = nn.Parameter(torch.tensor(0.2))
-        self.last_debug_info = {}
 
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
 
     def update_noise(self):
-        for param in self.fc_mu.parameters(): param.requires_grad = True
-        for param in self.fc_rho.parameters(): param.requires_grad = True
+        """Unfreeze trainable parts for new task"""
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
 
     def unfreeze_task_0(self):
+        """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
     def unfreeze_incremental(self):
+        """Task > 0: Train noise only"""
         self.update_noise()
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
     def after_task_training(self):
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.fc_mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.fc_rho.state_dict().items()}
+        # Snapshot
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
         
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
+        
+        # MagMax Merge
         self._perform_magmax_merge()
 
     def _perform_magmax_merge(self):
@@ -141,167 +142,118 @@ class PiNoise(nn.Module):
                 merged_dict[key] = best_param.to(self.w_down.device)
             return merged_dict
 
-        self.fc_mu.load_state_dict(get_merged_state(self.history_mu))
-        self.fc_rho.load_state_dict(get_merged_state(self.history_sigma))
+        self.mu.load_state_dict(get_merged_state(self.history_mu))
+        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
 
-    # [NEW] Hàm snapshot trọng số mu cũ để làm mốc phạt
-    def snapshot_old_weights(self):
-        self.old_fc_mu_weight = self.fc_mu.weight.data.clone().detach().float()
-        print(f"[SNAPSHOT] fc_mu weight norm = {self.old_fc_mu_weight.norm().item():.6f}")
-    #[NEW] Hàm tính Soft Orthogonal Penalty
-    # def compute_soft_ortho_penalty(self):
-    #     if self.core_U.shape[1] == 0:
-    #         print(f"[DEBUG] core_U empty → return 0")
-    #         return torch.tensor(0.0, device=self.fc_mu.weight.device)
-    #     if self.old_fc_mu_weight is None:
-    #         print(f"[DEBUG] old_fc_mu_weight is None → return 0")
-    #         return torch.tensor(0.0, device=self.fc_mu.weight.device)
+    def forward(self, hyper_features, new_forward=False):
+        # 1. Down Projection
+        x_down = hyper_features @ self.w_down 
         
-    #     w_curr = self.fc_mu.weight.float()
-    #     w_old  = self.old_fc_mu_weight.to(w_curr.device).float()
-    #     delta_W = w_curr - w_old
-        
-    #     # CHIẾU
-    #     projection = delta_W @ self.core_U.float()
-        
-    #     # SỬA TẠI ĐÂY: Dùng Norm thay vì bình phương
-    #     # penalty = ||Delta W @ U||_F
-    #     penalty = torch.norm(projection) 
-    
-    # # In kiểu khoa học để soi số siêu bé
-    # # print(f"[DEBUG] delta_W norm: {delta_W.norm().item():.6f}")
-    # # print(f"[DEBUG] penalty: {penalty.item():.2e}") # e để hiện 1.23e-05
-    #     return penalty
-    #ko có u
-    def compute_soft_ortho_penalty(self):
-    # Nếu chưa có trọng số cũ (Task 0) thì không phạt
-        if self.old_fc_mu_weight is None:
-            return torch.tensor(0.0, device=self.fc_mu.weight.device)
-        
-        # 1. Lấy trọng số hiện tại và trọng số cũ
-        w_curr = self.fc_mu.weight.float()  # Kích thước [Hidden, Hidden]
-        w_old  = self.old_fc_mu_weight.to(w_curr.device).float() # [Hidden, Hidden]
-        
-        # 2. Tính tích chéo (Dot product giữa các vector trọng số)
-        # Nếu w_curr và w_old trực giao, tích này phải xấp xỉ ma trận 0
-        dot_product = torch.matmul(w_curr, w_old.t())
-        
-        # 3. Tính Frobenius Norm bình phương (Tổng bình phương các phần tử)
-        # Chia cho bình phương hidden_dim để chuẩn hóa scale (tránh loss quá to)
-        penalty = torch.sum(dot_product.pow(2)) / (self.hidden_dim ** 2)
-        
-        # Debug để bác theo dõi
-        # print(f"[DEBUG] Traditional Ortho Loss: {penalty.item():.6f}")
-        
-        return penalty
-
-    def forward(self, hyper_features, return_kl=False):
-        x_down = hyper_features @ self.w_down
-        
-        if getattr(self, 'is_caching', False):
-            with torch.no_grad():
-                b = x_down.detach() 
-                if b.dim() > 2: 
-                    b = b.reshape(-1, b.shape[-1])
-                if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
-                    self.corr_matrix = torch.zeros((self.hidden_dim, self.hidden_dim), device=b.device)
-                self.corr_matrix += b.t() @ b
-
-        # [ĐÃ SỬA] Đưa x_down thẳng vào fc_mu (Không còn x_rogo)
-        mu = self.fc_mu(x_down)
-        sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
-        
+        # 2. Caching for GPM
         if self.training:
-            epsilon = torch.randn_like(sigma)
-            z = mu + sigma * epsilon
-        else:
-            z = mu 
+            # Cache vừa đủ để tính SVD, không cần quá nhiều gây OOM
+            if len(self.feature_cache) < 50: 
+                self.feature_cache.append(x_down.detach().cpu().float())
         
-        noise_projected = z @ self.w_up
-        effective_noise = self.noise_scale * noise_projected
-        out = hyper_features + effective_noise
+        # 3. Generate Noise
+        noise = self.mu(x_down) + self.sigma(x_down)
         
-        if self.training:
-            with torch.no_grad():
-                sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
-                noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
-                self.last_debug_info = {
-                    "signal": sig_norm,
-                    "noise": noise_norm,
-                    "snr": sig_norm / (noise_norm + 1e-9),
-                    "sigma": sigma.mean().item(),
-                    "scale": self.noise_scale.item()
-                }
-                
-        if return_kl:
-            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
-            return out, kl_div.mean()
-        else:
-            return out
+        # 4. Add Noise & Up Projection
+        return hyper_features + (noise @ self.w_up)
+
+    def apply_gradient_projection(self, scale=1.0):
+        """
+        GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
+        scale = 1.0: Strict GPM (Bảo vệ tuyệt đối)
+        scale < 1.0 (ví dụ 0.85): Cho phép mượn 15% không gian cũ
+        """
+        if self.core_U.shape[1] == 0: return
+        
+        with torch.no_grad():
+            U = self.core_U 
+            def project_grad(weight):
+                if weight.grad is not None:
+                    g_inner = weight.grad @ U 
+                    g_proj = g_inner @ U.t()
+                    
+                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
+                    # Nhân với scale để cho phép nới lỏng ràng buộc
+                    weight.grad -= (g_proj * scale)
+
+            project_grad(self.mu.weight)
+            project_grad(self.sigma.weight)
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
-        if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
-            return
+        """
+        Tính SVD trên Covariance Matrix.
+        Args:
+            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
+            val: Epsilon hoặc Ratio tương ứng.
+        """
+        if not self.feature_cache: return
         
-        C = self.corr_matrix.cpu() 
-        self.corr_matrix = None 
-        total_energy = torch.trace(C).item()
+        device = 'cpu' # Tiết kiệm VRAM tối đa
+        correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
+        
+        for batch in self.feature_cache:
+            b = batch.to(device)
+            if b.dim() > 2: b = b.reshape(-1, b.shape[-1])
+            correlation_matrix += b.t() @ b
+            del b
+            
+        self.feature_cache = []
+        gc.collect()
+
+        # 2. SVD
+        try:
+            U, S, _ = torch.linalg.svd(correlation_matrix)
+        except:
+            U, S, _ = torch.svd(correlation_matrix)
+        
+        # 3. CHỌN K
+        if mode == 'eigenvalue':
+            max_s = S[0]
+            if max_s == 0: k = 0
+            else:
+                relative_S = S / max_s
+                k = (relative_S > val).sum().item()
+            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
+
+        elif mode == 'threshold':
+            total_var = torch.sum(S)
+            s_cumsum = torch.cumsum(S, dim=0)
+            k = torch.searchsorted(s_cumsum, total_var * val).item()
+            print(f"--> GPM Selection (Energy {val}): Need {k} dims.")
+            
+        else: # ratio
+            k = max(1, int(self.hidden_dim * val))
+            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
+
+        # =================================================================
+        # 4. SAFETY MARGIN (BẮT BUỘC)
+        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
+        # dù Core Space đã đầy.
+        # =================================================================
+        MARGIN = 12 
+        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
+        
+        # Cắt bớt nếu vượt quá trần
+        k = min(k, MAX_ALLOWED_RANK)
+        
+        # 5. Update Memory
+        U_new = U[:, :k+1].to(self.core_U.device)
 
         if self.core_U.shape[1] == 0:
-            try:
-                U, S, _ = torch.linalg.svd(C)
-            except:
-                U, S, _ = torch.svd(C)
-            
-            s_cumsum = torch.cumsum(S, dim=0)
-            k = torch.searchsorted(s_cumsum, total_energy * val).item()
-            if k == 0 and total_energy > 0: k = 1
-            
-            MARGIN = 12 
-            MAX_ALLOWED_RANK = self.hidden_dim - MARGIN
-            k = min(k, MAX_ALLOWED_RANK)
-            
-            self.core_U = U[:, :k+1].to(self.core_U.device)
-            print(f"==> [CHECK GPM] Task 0 Finished:")
-            print(f"    - Core U Shape: {self.core_U.shape}") # Ví dụ: [192, 45]
-            print(f"    - Số chiều (Rank): {self.core_U.shape[1]}")
+            self.core_U = U_new
         else:
-            U_old = self.core_U.cpu()
-            P = U_old @ U_old.t()
-            I = torch.eye(self.hidden_dim)
+            combined = torch.cat([self.core_U, U_new], dim=1)
+            U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
             
-            I_minus_P = I - P
-            C_hat = I_minus_P @ C @ I_minus_P
-            
-            residual_energy = torch.trace(C_hat).item()
-            proj_energy = total_energy - residual_energy
-            
-            if proj_energy >= total_energy * val:
-                print(f"--> GPM Task mới: Đã cover {proj_energy/total_energy*100:.1f}%. KHÔNG thêm chiều mới!")
-                return
-            
-            try:
-                U_new, S_new, _ = torch.linalg.svd(C_hat)
-            except:
-                U_new, S_new, _ = torch.svd(C_hat)
-                
-            target_residual_energy = (total_energy * val) - proj_energy
-            
-            s_cumsum = torch.cumsum(S_new, dim=0)
-            k = torch.searchsorted(s_cumsum, target_residual_energy).item()
-            if k == 0 and target_residual_energy > 0: k = 1
-            
-            MARGIN = 12 
-            MAX_ALLOWED_RANK = self.hidden_dim - MARGIN
-            
-            U_new_k = U_new[:, :k+1].to(self.core_U.device)
-            self.core_U = torch.cat([self.core_U, U_new_k], dim=1)
-            
-            if self.core_U.shape[1] > MAX_ALLOWED_RANK:
-                self.core_U = self.core_U[:, :MAX_ALLOWED_RANK]
-                
-            print(f"--> GPM Task mới: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
+            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
+            final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
+            self.core_U = U_final[:, :final_k]
 
+        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
 
 
 class Attention(nn.Module):

@@ -54,6 +54,7 @@ class MinNet(object):
         self.total_acc = []
         self.class_acc = []
         self.task_acc = []
+        self.old_noise_weights = []
         
         # Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
@@ -62,7 +63,14 @@ class MinNet(object):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
+    def _snapshot_local_weights(self):
+        """Lưu toàn bộ trọng số của Noise Generator (Cả Mu và Rho)"""
+        self.old_noise_weights = []
+        for block in self._network.backbone.noise_maker:
+            self.old_noise_weights.append({
+                'mu': block.fc_mu.weight.detach().clone(),
+                'rho': block.fc_rho.weight.detach().clone()
+            })
     def after_train(self, data_manger):
         if self.cur_task == 0:
             self.known_class = self.init_class
@@ -135,8 +143,11 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(dataloader=train_loader, mode='threshold')
-        self._network.snapshot_noise_weights()
+        self._snapshot_local_weights()
+        self._network.collect_projections(mode='threshold', val=0.95)
+        #self._network.after_task_magmax_merge()
+        #self.analyze_model_sparsity()
+        
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -176,63 +187,124 @@ class MinNet(object):
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
+
         self.test_loader = test_loader
 
-        # [FIX 1: QUAN TRỌNG] Phải update FC (mở rộng class) TRƯỚC KHI fit
-        # Để fit_fc biết được đúng số lượng class mới
-        self._network.update_fc(self.increment)
-        
-        # Update Noise Generator cho task mới
-        self._network.update_noise()
-
-        # [STEP 1] Analytic Learning (RLS)
-        # Fit trên dữ liệu task mới (đồng thời tích lũy vào bộ nhớ A_global, B_global)
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-        
+
         self.fit_fc(train_loader, test_loader)
 
-        # [STEP 2] Training Noise (SGD)
-        # Tạo lại loader với batch_size nhỏ hơn cho việc train noise
-        train_loader_sgd = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                        num_workers=self.num_workers)
+        self._network.update_fc(self.increment)
+
+        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
+                                    num_workers=self.num_workers)
+        self._network.update_noise()
         
         self._clear_gpu()
-        self._network.snapshot_noise_weights()
-        self.run(train_loader_sgd)
+
+        self.run(train_loader)
+        self._snapshot_local_weights()
+        self._network.collect_projections(mode='threshold', val=0.95)
+        #self._network.after_task_magmax_merge()
+        #self.analyze_model_sparsity()
         
-        #collect projection
-        self._network.collect_projections(dataloader=train_loader, mode='threshold')
-        self._network.snapshot_noise_weights()
         self._clear_gpu()
+
 
         del train_set
 
-        # [STEP 3] Re-Fit Analytic Classifier (Final Polish)
-        # Dùng tập train không augmentation để chốt hạ classifier
-        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        
-        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
-                                         num_workers=self.num_workers)
+        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set.labels = self.cat2order(train_set.labels, data_manger)
+
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+                                    num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+                                    num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader_no_aug, test_loader)
-        
-        del train_set_no_aug, test_set
+        self.re_fit(train_loader, test_loader)
+        #self.check_rls_quality()
+        del train_set, test_set
         self._clear_gpu()
 
+    def fit_fc(self, train_loader, test_loader):
+        self._network.eval()
+        self._network.to(self.device)
 
+        prog_bar = tqdm(range(self.fit_epoch))
+        for _, epoch in enumerate(prog_bar):
+            self._network.to(self.device)
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                targets = torch.nn.functional.one_hot(targets)
+                self._network.fit(inputs, targets)
+            
+            info = "Task {} --> Update Analytical Classifier!".format(
+                self.cur_task,
+            )
+            self.logger.info(info)
+            prog_bar.set_description(info)
+            self._clear_gpu()
+
+    def re_fit(self, train_loader, test_loader):
+        self._network.eval()
+        self._network.to(self.device)
+        prog_bar = tqdm(train_loader)
+        for i, (_, inputs, targets) in enumerate(prog_bar):
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            targets = torch.nn.functional.one_hot(targets)
+            self._network.fit(inputs, targets)
+
+            info = "Task {} --> Reupdate Analytical Classifier!".format(
+                self.cur_task,
+            )
+            
+            self.logger.info(info)
+            prog_bar.set_description(info)
+        self._clear_gpu()
+
+    def compute_adaptive_scale(self, current_loader):
+        # 1. Tính prototype task hiện tại
+        curr_proto = self.get_task_prototype(self._network, current_loader)
+        
+        if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
+        
+        if not self.old_prototypes:
+            self.old_prototypes.append(curr_proto)
+            return 0.95 # Task đầu tiên chưa cần scale, hoặc scale cao
+            
+        # 2. So sánh với quá khứ
+        max_sim = 0.0
+        curr_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
+        for old_p in self.old_prototypes:
+            old_norm = F.normalize(old_p.unsqueeze(0), p=2, dim=1)
+            sim = torch.mm(curr_norm, old_norm.t()).item()
+            if sim > max_sim: max_sim = sim
+                
+        self.old_prototypes.append(curr_proto)
+        
+        # 3. Tính Scale: Giống nhau nhiều -> Scale thấp (để học đè lên). Khác nhau -> Scale cao.
+        # Công thức: Scale chạy từ 0.5 đến 0.95
+        scale = 0.5 + 0.5 * (1.0 - max_sim)
+        scale = max(0.65, min(scale, 0.95)) # Kẹp giá trị an toàn
+        
+        self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
+        return scale
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # --- Setup Optimizer ---
+        current_scale = 0.85 
+        if self.cur_task > 0:
+            current_scale = self.compute_adaptive_scale(train_loader)
+
+        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -242,19 +314,17 @@ class MinNet(object):
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
-        print(f"DEBUG: Optimizer is tracking {len(optimizer.param_groups[0]['params'])} parameters.")
 
+        prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
 
-        max_beta = 1e-4 
-        lambda_ortho = 1e6 # Hệ số phạt "khủng" của mày đây
-        
-        prog_bar = tqdm(range(epochs))
+        LAMBDA_ORTHO = 100000.0  # Bác có thể chỉnh hệ số phạt ở đây
+
         for _, epoch in enumerate(prog_bar):
-            losses, ce_losses, kl_losses, ortho_losses = 0.0, 0.0, 0.0, 0.0
+            losses = 0.0
+            ortho_losses = 0.0 # Tracking riêng Ortho Loss
             correct, total = 0, 0
-            beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -264,181 +334,68 @@ class MinNet(object):
                     if self.cur_task > 0:
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
-                        logits2, batch_kl = self._network.forward_with_ib(inputs)
+                        logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1
                     else:
-                        logits_final, batch_kl = self._network.forward_with_ib(inputs)
+                        logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                    
+                    loss = F.cross_entropy(logits_final, targets.long())
 
-                    # --- TÍNH LOSS ---
-                    logits_final = logits_final.float() 
-                    targets = targets.long().reshape(-1)
-                    ce_loss = F.cross_entropy(logits_final, targets)
-                    
-                    current_batch_ortho = 0.0
-                    if self.cur_task > 0:
-                        raw_ortho = 0.0
-                        for block in self._network.backbone.noise_maker:
-                            raw_ortho += block.compute_soft_ortho_penalty()
+                    # [NEW] Tính hàm phạt Ortho Loss mềm trực tiếp thay thế GPM cứng
+                    batch_ortho = 0.0
+                    if self.cur_task > 0 and len(self.old_noise_weights) > 0:
+                        for idx, block in enumerate(self._network.backbone.noise_maker):
+                            old_dict = self.old_noise_weights[idx]
+                            
+                            # 1. Phạt mu
+                            w_mu_curr = block.fc_mu.weight.float()
+                            w_mu_old = old_dict['mu'].to(w_mu_curr.device).float()
+                            dot_mu = torch.matmul(w_mu_curr, w_mu_old.t())
+                            batch_ortho += torch.sum(dot_mu.pow(2)) / w_mu_curr.shape[0]
+                            
+                            # 2. Phạt rho
+                            w_rho_curr = block.fc_rho.weight.float()
+                            w_rho_old = old_dict['rho'].to(w_rho_curr.device).float()
+                            dot_rho = torch.matmul(w_rho_curr, w_rho_old.t())
+                            batch_ortho += torch.sum(dot_rho.pow(2)) / w_rho_curr.shape[0]
                         
-                        # NHÂN LUÔN HỆ SỐ Ở ĐÂY ĐỂ IN RA CHO CHUẨN
-                        current_batch_ortho = lambda_ortho * raw_ortho
-                        loss = ce_loss + beta_current * batch_kl + current_batch_ortho
-                    else:
-                        loss = ce_loss + beta_current * batch_kl
-                    
+                        loss = loss + LAMBDA_ORTHO * batch_ortho
+
                 self.scaler.scale(loss).backward()
+                
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
-                # --- LƯU TRỮ METRICS ---
                 losses += loss.item()
-                ce_losses += ce_loss.item()      
-                kl_losses += batch_kl.item()     
-                if self.cur_task > 0:
-                    # Cộng cái đã nhân 10000 vào để tính trung bình epoch
-                    ortho_losses += current_batch_ortho.item() if torch.is_tensor(current_batch_ortho) else current_batch_ortho
+                if self.cur_task > 0 and torch.is_tensor(batch_ortho):
+                    ortho_losses += (LAMBDA_ORTHO * batch_ortho).item()
                 
                 _, preds = torch.max(logits_final, dim=1)
-                correct += preds.eq(targets).sum().item()
-                total += targets.size(0)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+                
+                del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
 
-            # --- IN RA CHI TIẾT ---
-            avg_ce = ce_losses / len(train_loader)
-            avg_kl = kl_losses / len(train_loader)
-            
             if self.cur_task > 0:
-                avg_ortho_weighted = ortho_losses / len(train_loader)
-                # Dùng :.6f để thấy được các giá trị nhỏ sau khi nhân 10000
-                info = "T {} | Ep {} | Acc {:.2f} | CE {:.3f} | KL {:.1f} | Ortho_W {:.6f}".format(
-                    self.cur_task, epoch + 1, train_acc, avg_ce, avg_kl, avg_ortho_weighted
+                avg_ortho = ortho_losses / len(train_loader)
+                info = "Task {} | Ep {}/{} | L {:.3f} | Ortho {:.4f} | Acc {:.2f} | Scale {:.2f}".format(
+                    self.cur_task, epoch + 1, epochs, losses / len(train_loader), avg_ortho, train_acc, current_scale
                 )
             else:
-                info = "T {} | Ep {} | Acc {:.2f} | CE {:.3f} | KL {:.1f}".format(
-                    self.cur_task, epoch + 1, train_acc, avg_ce, avg_kl
+                info = "Task {} | Ep {}/{} | L {:.3f} | Acc {:.2f} | Scale {:.2f}".format(
+                    self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc, current_scale
                 )
             
             self.logger.info(info)
             prog_bar.set_description(info)
+            print(info)
             
-            if epoch % 5 == 0: self._clear_gpu()
+            if epoch % 5 == 0:
+                self._clear_gpu()
     
-    def fit_fc(self, train_loader, test_loader):
-        # [FIX 2: MEMORY ACCUMULATION]
-        # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
-        # Nếu tính lại từ đầu, model sẽ quên sạch quá khứ.
-        
-        self._network.eval()
-        self._network.to(self.device)
-        
-        # 1. Xác định kích thước feature
-        with torch.no_grad():
-            dummy_input = next(iter(train_loader))[1].to(self.device)
-            dummy_feat = self._network.extract_feature(dummy_input)
-            if hasattr(self._network, 'buffer'):
-                dummy_feat = self._network.buffer(dummy_feat.float())
-            feat_dim = dummy_feat.shape[1]
-        
-        # Lấy tổng số class ĐÃ ĐƯỢC MỞ RỘNG
-        num_classes = self._network.known_class
-        
-        # 2. Khởi tạo Global Memory nếu chưa có (lưu trong self của MinNet để persist qua các task)
-        if not hasattr(self, 'A_global'):
-            print("--> Initializing Global RLS Memory...")
-            self.A_global = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-            self.B_global = torch.zeros((feat_dim, 0), device=self.device, dtype=torch.float32)
-
-        # Mở rộng B_global nếu số class tăng lên
-        current_B_cols = self.B_global.shape[1]
-        if num_classes > current_B_cols:
-            diff = num_classes - current_B_cols
-            expansion = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float32)
-            self.B_global = torch.cat([self.B_global, expansion], dim=1)
-            
-        print(f"--> Accumulating Statistics for Task {self.cur_task} (Total Classes: {num_classes})...")
-        
-        # 3. Tích lũy thống kê (Chỉ cộng thêm phần của Task mới)
-        # Lưu ý: A_new và B_new là thống kê của RIÊNG dữ liệu hiện tại
-        A_new = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-        B_new = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
-        fit_epochs = self.fit_epoch 
-        
-        for epoch in range(fit_epochs):
-            with torch.no_grad():
-                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"Ep {epoch+1}")):
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    if targets.dim() > 1: targets = targets.view(-1)
-                    
-                    # Forward
-                    features = self._network.extract_feature(inputs).float()
-                    features = self._network.buffer(features)
-                    
-                    # One-hot (đã an toàn vì num_classes được update từ bước update_fc)
-                    targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
-                    
-                    A_new += features.T @ features
-                    B_new += features.T @ targets_oh
-        
-        # 4. Cộng vào bộ nhớ toàn cục
-        self.A_global += A_new
-        self.B_global += B_new
-        
-        # 5. Giải hệ phương trình trên bộ nhớ toàn cục
-        # W = (A_global + gamma * I)^-1 @ B_global
-        print("--> Solving Global Linear System...")
-        gamma = self.args['gamma']
-        I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
-        A_reg = self.A_global + gamma * I
-        
-        try:
-            W = torch.linalg.solve(A_reg, self.B_global)
-        except RuntimeError:
-            W = torch.linalg.pinv(A_reg) @ self.B_global
-            
-        # 6. Gán trọng số
-        if self._network.weight.shape != W.shape:
-            self._network.weight = torch.zeros_like(W)
-        self._network.weight.data = W
-            
-        print("--> Analytic Learning Finished.")
-        self._clear_gpu()
-
-    def re_fit(self, train_loader, test_loader):
-        # re_fit dùng chung logic với fit_fc
-        print(f"--> Refitting Task {self.cur_task} (No Augmentation)...")
-        self.fit_fc(train_loader, test_loader)
-       
-    
-    def print_noise_status(self):
-        print("\n" + "="*85)
-        print(f"{'Layer':<10} | {'Signal':<10} | {'Noise':<10} | {'SNR':<10} | {'Sigma':<10} | {'Scale':<10} | {'Status'}")
-        print("-" * 85)
-        
-        # Lấy danh sách các lớp Noise từ backbone
-        # Lưu ý: Cấu trúc backbone của bạn có thể khác, hãy đảm bảo path đúng
-        # Ví dụ: self._network.backbone.noise_maker
-        noise_layers = []
-        if hasattr(self._network.backbone, 'noise_maker'):
-             noise_layers = self._network.backbone.noise_maker
-        
-        for i, layer in enumerate(noise_layers):
-            # Kiểm tra xem lớp đó có biến last_debug_info không (đã thêm ở bước trước)
-            if not hasattr(layer, 'last_debug_info') or not layer.last_debug_info: 
-                continue
-            
-            info = layer.last_debug_info
-            
-            # Đánh giá trạng thái
-            snr = info['snr']
-            if snr < 1.0: status = "TOXIC ☠️"       # Nhiễu to hơn tín hiệu
-            elif snr < 10.0: status = "HEAVY ⚠️"    # Nhiễu nặng
-            elif snr > 1000.0: status = "USELESS 💤" # Nhiễu quá bé
-            else: status = "GOOD ✅"                # 10 < SNR < 1000
-            
-            print(f"L{i:<9} | {info['signal']:.4f}     | {info['noise']:.4f}     | {snr:.1f}       | {info['sigma']:.4f}     | {info['scale']:.4f}     | {status}")
-        print("="*85 + "\n")
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
