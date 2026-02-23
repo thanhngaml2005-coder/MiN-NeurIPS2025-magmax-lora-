@@ -232,7 +232,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # Freeze/Unfreeze Logic
+        # --- Setup Optimizer ---
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -244,34 +244,20 @@ class MinNet(object):
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
         print(f"DEBUG: Optimizer is tracking {len(optimizer.param_groups[0]['params'])} parameters.")
 
-        prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
 
-        WARMUP_EPOCHS = 2
         max_beta = 1e-4 
+        lambda_ortho = 10000  # Hệ số phạt "khủng" của mày đây
         
+        prog_bar = tqdm(range(epochs))
         for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            ce_losses = 0.0 
-            kl_losses = 0.0 
-            ortho_losses = 0.0 # [NEW] Tracking loss trực giao
+            losses, ce_losses, kl_losses, ortho_losses = 0.0, 0.0, 0.0, 0.0
             correct, total = 0, 0
-
             beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
-                # Chỉ in 1 lần ở batch đầu epoch đầu
-                if i == 0 and epoch == 0:
-                    block = self._network.backbone.noise_maker[0]
-                    print(f"[RUN START] fc_mu requires_grad = {block.fc_mu.weight.requires_grad}")
-                    print(f"[RUN START] fc_mu norm = {block.fc_mu.weight.norm().item():.6f}")
-                    if block.old_fc_mu_weight is not None:
-                        print(f"[RUN START] old_weight norm = {block.old_fc_mu_weight.norm().item():.6f}")
-                    else:
-                        print(f"[RUN START] old_weight = None (Task 0, bình thường)")
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
                 optimizer.zero_grad(set_to_none=True) 
 
                 with autocast('cuda'):
@@ -283,68 +269,62 @@ class MinNet(object):
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                # CALC LOSS
-                logits_final = logits_final.float() 
-                if targets.dim() > 1: targets = targets.reshape(-1)
-                targets = targets.long()
-
-                ce_loss = F.cross_entropy(logits_final, targets)
-                
-                # [NEW] CÁCH TÍNH SOFT ORTHOGONAL PENALTY
-                total_ortho_penalty = 0.0
-                if self.cur_task > 0:
-                    lambda_ortho = 10000  # Hệ số phạt: Bác có thể tune (vd: 10, 100, 500)
-                    for block in self._network.backbone.noise_maker:
-                        total_ortho_penalty += block.compute_soft_ortho_penalty()
+                    # --- TÍNH LOSS ---
+                    logits_final = logits_final.float() 
+                    targets = targets.long().reshape(-1)
+                    ce_loss = F.cross_entropy(logits_final, targets)
                     
-                    loss = ce_loss + beta_current * batch_kl + lambda_ortho * total_ortho_penalty
-                else:
-                    loss = ce_loss + beta_current * batch_kl
+                    current_batch_ortho = 0.0
+                    if self.cur_task > 0:
+                        raw_ortho = 0.0
+                        for block in self._network.backbone.noise_maker:
+                            raw_ortho += block.compute_soft_ortho_penalty()
+                        
+                        # NHÂN LUÔN HỆ SỐ Ở ĐÂY ĐỂ IN RA CHO CHUẨN
+                        current_batch_ortho = lambda_ortho * raw_ortho
+                        loss = ce_loss + beta_current * batch_kl + current_batch_ortho
+                    else:
+                        loss = ce_loss + beta_current * batch_kl
                     
                 self.scaler.scale(loss).backward()
-                
-                # [XÓA] Xóa đoạn unscale và apply_gpm_to_grads đi!
-                
                 self.scaler.step(optimizer)
-                # Sau lệnh self.scaler.update() trong hàm run()
-               
                 self.scaler.update()
                 
-                # METRICS & LOGGING
+                # --- LƯU TRỮ METRICS ---
                 losses += loss.item()
                 ce_losses += ce_loss.item()      
                 kl_losses += batch_kl.item()     
                 if self.cur_task > 0:
-                    ortho_losses += total_ortho_penalty.item()
+                    # Cộng cái đã nhân 10000 vào để tính trung bình epoch
+                    ortho_losses += current_batch_ortho.item() if torch.is_tensor(current_batch_ortho) else current_batch_ortho
                 
                 _, preds = torch.max(logits_final, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-                
-                del inputs, targets, loss, logits_final, batch_kl
+                correct += preds.eq(targets).sum().item()
+                total += targets.size(0)
 
             scheduler.step()
             train_acc = 100. * correct / total
 
-            # [HIỂN THỊ INFO MỚI]
+            # --- IN RA CHI TIẾT ---
+            avg_ce = ce_losses / len(train_loader)
+            avg_kl = kl_losses / len(train_loader)
+            
             if self.cur_task > 0:
-                info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.2f} | Ortho {:.4f}) | Acc {:.2f}".format(
-                    self.cur_task, epoch + 1, 
-                    losses / len(train_loader), ce_losses / len(train_loader),
-                    kl_losses / len(train_loader), ortho_losses / len(train_loader), train_acc
+                avg_ortho_weighted = ortho_losses / len(train_loader)
+                # Dùng :.6f để thấy được các giá trị nhỏ sau khi nhân 10000
+                info = "T {} | Ep {} | Acc {:.2f} | CE {:.3f} | KL {:.1f} | Ortho_W {:.6f}".format(
+                    self.cur_task, epoch + 1, train_acc, avg_ce, avg_kl, avg_ortho_weighted
                 )
             else:
-                info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.2f}) | Acc {:.2f}".format(
-                    self.cur_task, epoch + 1, 
-                    losses / len(train_loader), ce_losses / len(train_loader),
-                    kl_losses / len(train_loader), train_acc
+                info = "T {} | Ep {} | Acc {:.2f} | CE {:.3f} | KL {:.1f}".format(
+                    self.cur_task, epoch + 1, train_acc, avg_ce, avg_kl
                 )
             
             self.logger.info(info)
             prog_bar.set_description(info)
             
-            if epoch % 5 == 0:
-                self._clear_gpu()
+            if epoch % 5 == 0: self._clear_gpu()
+    
     def fit_fc(self, train_loader, test_loader):
         # [FIX 2: MEMORY ACCUMULATION]
         # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
