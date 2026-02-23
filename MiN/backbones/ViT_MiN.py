@@ -219,9 +219,9 @@ class PiNoise(nn.Module):
         if self.core_U.shape[1] == 0: return
         
         with torch.no_grad():
-            project_grad(self.fc_mu.weight, "fc_mu")
-
             U = self.core_U 
+            
+            # 1. PHẢI ĐỊNH NGHĨA HÀM NÀY TRƯỚC
             def project_grad(weight, name=""):
                 if weight.grad is not None:
                     # Lưu lại Gradient gốc để đo lường
@@ -239,9 +239,6 @@ class PiNoise(nn.Module):
                         mag_proj = torch.norm(g_proj).item()
                         mag_new = torch.norm(weight.grad).item()
                         
-                        # Đo lượng vi phạm CÒN LẠI của g_new lên U_core
-                        # Nếu scale = 1.0, cái này phải bằng 0. 
-                        # Nếu scale = 0.3, cái này phải bằng đúng 70% mag_proj ban đầu.
                         g_new_proj = (weight.grad @ U) @ U.t()
                         mag_remaining = torch.norm(g_new_proj).item()
                         
@@ -250,12 +247,11 @@ class PiNoise(nn.Module):
                         print(f"      - Độ lớn Bóng(phạt) : {mag_proj:.4f} (Chiếm {mag_proj/mag_orig*100:.1f}%)")
                         print(f"      - Lực vi phạm CÒN LẠI: {mag_remaining:.4f} (Kỳ vọng: {mag_proj * (1 - scale):.4f})")
                     # --- DEBUG GRADIENT ---
-                    
-            # Gọi hàm (truyền thêm tên để dễ nhìn)
+            
+            # 2. RỒI MỚI GỌI HÀM SAU
             project_grad(self.fc_mu.weight, "fc_mu")
-            project_grad(self.fc_rho.weight, "fc_rho")
-
-          
+            
+            # (Tuyệt đối không chém fc_rho và rogo_scale nhé, để chúng nó tự do)     
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
