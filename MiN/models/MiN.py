@@ -293,7 +293,7 @@ class MinNet(object):
                 # [NEW] CÁCH TÍNH SOFT ORTHOGONAL PENALTY
                 total_ortho_penalty = 0.0
                 if self.cur_task > 0:
-                    lambda_ortho = 100.0  # Hệ số phạt: Bác có thể tune (vd: 10, 100, 500)
+                    lambda_ortho = 500.0  # Hệ số phạt: Bác có thể tune (vd: 10, 100, 500)
                     for block in self._network.backbone.noise_maker:
                         total_ortho_penalty += block.compute_soft_ortho_penalty()
                     
@@ -307,15 +307,7 @@ class MinNet(object):
                 
                 self.scaler.step(optimizer)
                 # Sau lệnh self.scaler.update() trong hàm run()
-                if i % 100 == 0: # Cứ 100 batch in 1 lần
-                    with torch.no_grad():
-                        mu_weight = self._network.backbone.noise_maker[0].fc_mu.weight
-                        mu_grad = mu_weight.grad
-                        
-                        weight_norm = torch.norm(mu_weight).item()
-                        grad_norm = torch.norm(mu_grad).item() if mu_grad is not None else 0.0
-                        
-                        print(f"\n[Weight Check L0] Norm: {weight_norm:.6f} | Grad: {grad_norm:.6e}")
+               
                 self.scaler.update()
                 
                 # METRICS & LOGGING
