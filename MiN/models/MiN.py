@@ -201,7 +201,7 @@ class MinNet(object):
         self.run(train_loader_sgd)
         
         # Thu thập GPM Projection sau khi train xong noise
-        self._network.collect_projections(dataloader=train_loader_sgd, mode='threshold', val=0.85)
+        self._network.collect_projections(dataloader=train_loader_sgd, mode='threshold', val=0.98)
         self._clear_gpu()
 
         del train_set
