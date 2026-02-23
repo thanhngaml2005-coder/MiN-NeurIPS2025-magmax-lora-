@@ -228,7 +228,7 @@ class MiNbaseNet(nn.Module):
         for i, block in enumerate(self.backbone.noise_maker):
             # Tự động tính val theo độ sâu của layer
             depth_ratio = i / max(1, (num_layers - 1))
-            current_val = 0.96 - depth_ratio * (0.96 - 0.85)
+            current_val = 0.99 - depth_ratio * (0.99 - 0.8)
             
             # Gọi tính SVD với current_val vừa tính
             block.compute_projection_matrix(mode=mode, val=current_val)
