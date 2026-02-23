@@ -21,5 +21,5 @@
   "num_workers": 4,
   "buffer_size": 16384,
   "gamma": 100,
-  "hidden_dim": 192
+  "hidden_dim": 256
 }

@@ -306,15 +306,7 @@ class PiNoise(nn.Module):
             
             # Nếu Task cũ đã cover đủ ngưỡng (val) -> KHÔNG CẦN THÊM CHIỀU MỚI!
             if proj_energy >= total_energy * val:
-                # ÉP BUỘC LẤY 1 CHIỀU ĐỂ TRÁNH GHI ĐÈ!
-                k = 4
-                # Lấy 1 vector từ SVD của phần dư (C_hat)
-                try: U_new, _, _ = torch.linalg.svd(C_hat)
-                except: U_new, _, _ = torch.svd(C_hat)
-                
-                U_new_k = U_new[:, :k+1].to(self.core_U.device)
-                self.core_U = torch.cat([self.core_U, U_new_k], dim=1)
-                print(f"--> Đã cover đủ, nhưng ÉP thêm {k+1} chiều! Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
+                print(f"--> GPM Task mới: Đã cover {proj_energy/total_energy*100:.1f}%. KHÔNG thêm chiều mới!")
                 return
             
             # 3. SVD trên phần Residual (Phần khác biệt)
