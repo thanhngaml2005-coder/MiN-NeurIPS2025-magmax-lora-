@@ -209,23 +209,26 @@ class MiNbaseNet(nn.Module):
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
     
+    # FILE: utils/inc_net.py
+
     def collect_projections(self, dataloader, mode='threshold'):
         print("--> [GPM] Đang thu thập đặc trưng để tính SVD...")
-        for block in self._network.backbone.noise_maker: 
+        
+        # SỬA TẠI ĐÂY: self chính là mạng rồi, gọi thẳng self.backbone
+        for block in self.backbone.noise_maker: 
             block.is_caching = True
             
-        self._network.eval()
+        self.eval()
         with torch.no_grad():
-            for _, inputs, _ in dataloader:
+            for _, inputs, targets in dataloader: # Thêm targets vào để tránh lỗi unpack
                 inputs = inputs.to(self.device)
-                # PHẢI dùng forward_with_ib để dữ liệu chảy qua các khối PiNoise
-                _ = self._network.forward_with_ib(inputs) 
+                # SỬA TẠI ĐÂY: gọi thẳng self.forward_with_ib
+                _ = self.forward_with_ib(inputs) 
                 
-        # Sau vòng lặp này, các block.corr_matrix mới có dữ liệu để tính SVD
-        num_layers = len(self._network.backbone.noise_maker)
-        for i, block in enumerate(self._network.backbone.noise_maker):
+        num_layers = len(self.backbone.noise_maker)
+        for i, block in enumerate(self.backbone.noise_maker):
             depth_ratio = i / max(1, (num_layers - 1))
-            current_val = 0.99 - depth_ratio * (0.99 - 0.85)
+            current_val = 0.96 - depth_ratio * (0.96 - 0.85) # Ngưỡng năng lượng động
             block.compute_projection_matrix(mode=mode, val=current_val)
             block.is_caching = False
     # [NEW] Thêm hàm này vào MiNbaseNet
