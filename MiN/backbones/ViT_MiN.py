@@ -144,14 +144,18 @@ class PiNoise(torch.nn.Linear):
             sigma = F.softplus(self.sigmma[i](x_down)) + 1e-6 
             
             # [NEW] KL Loss và nhiễu chỉ bật trên Task ĐANG TRAIN (task cuối)
-            if self.training and i == len(self.mu) - 1:
-                eps = torch.randn_like(sigma)
-                z = mu + sigma * eps
-                kl = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
-                total_kl = kl.mean()
-            else:
-                z = mu # Quá khứ đóng băng, chỉ xuất Mean
-
+            if self.training:
+            eps = torch.randn_like(sigma)
+            z = mu + sigma * eps
+            
+            # [CHỐNG NAN]: Ép kiểu về Float32 trước khi bình phương và tính Sum
+            mu_f32 = mu.float()
+            sigma_f32 = sigma.float()
+            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma_f32) - mu_f32.pow(2) - sigma_f32.pow(2), dim=1)
+            total_kl = kl_div.mean()
+        else:
+            z = mu 
+            total_kl = 0.0
             # An toàn nếu weight_noise chưa được init (ví dụ: epoch đầu Task 0)
             w = 1.0 if self.weight_noise is None else self.weight_noise[i]
 
