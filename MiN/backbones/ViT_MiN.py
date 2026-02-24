@@ -73,39 +73,36 @@ from torch import nn
 from torch.nn import functional as F
 import gc
 
-class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=192):
+def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
         
-        # --- Shared Fixed Parts (LoRA-style) ---
         self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
         nn.init.xavier_uniform_(self.w_down)
-        
         self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
         nn.init.xavier_uniform_(self.w_up)
-        
         self.hidden_dim = hidden_dim
         
-        # --- Trainable Parts (MagMax targets) ---
-        # [ĐÃ THỐNG NHẤT]: Chỉ dùng mu và sigma cho toàn bộ quá trình
         self.mu = nn.Linear(hidden_dim, hidden_dim)
         self.sigma = nn.Linear(hidden_dim, hidden_dim)
-        
-        # [AN TOÀN]: Khởi tạo Bias = 0.0 để Sigma không bị chết Gradient
         nn.init.constant_(self.mu.weight, 0.)
         nn.init.constant_(self.mu.bias, 0.)
         nn.init.constant_(self.sigma.weight, 0.)
         nn.init.constant_(self.sigma.bias, 0.0) 
         
-        # --- History for MagMax ---
-        self.history_mu = []    
-        self.history_sigma = [] 
+        # =======================================================
+        # [CHUẨN MAGMAX]: LƯU LẠI STATE BAN ĐẦU (BASE MODEL)
+        # =======================================================
+        self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
+        self.base_sigma_sd = {k: v.detach().clone() for k, v in self.sigma.state_dict().items()}
         
-        # --- GPM Buffers ---
+        # Lịch sử bây giờ sẽ lưu Task Vectors (Tau)
+        self.history_tau_mu = []    
+        self.history_tau_sigma = [] 
+        
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
         self.feature_cache = [] 
+        self.collecting = False  # [CỜ GPM]: Bật lên khi cần thu thập feature
         
-        # Learnable Scaling Factor
         self.noise_scale = nn.Parameter(torch.tensor(0.1))
         self.last_debug_info = {}
 
@@ -129,47 +126,104 @@ class PiNoise(nn.Module):
     # =====================================================================
     # [MAGMAX CORE LOGIC]
     # =====================================================================
+    À, ra là bác quyết định "trảm" luôn thằng GPM cho rảnh nợ!
+
+Thực ra quyết định này của bác rất hợp lý. GPM (Gradient Projection Memory) tính toán ma trận SVD cồng kềnh, tốn thời gian và đôi khi làm mạng học rất chậm. Khi bác đã có VIB (tạo nút thắt thông tin) kết hợp với MagMax (bảo vệ Task Vector lớn nhất) thì hệ thống đã có đủ giáp để chống Catastrophic Forgetting rồi. Lược bỏ GPM đi code sẽ siêu sạch và chạy nhanh như gió!
+
+Vậy tôi dọn sạch bóng dáng của GPM khỏi 3 file luôn cho bác nhé. Bác chỉ việc copy đè vào là xong:
+
+1. File Vit_min.py (Xóa sạch GPM, chỉ giữ VIB + MagMax)
+Python
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+class PiNoise(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dim=192):
+        super(PiNoise, self).__init__()
+        
+        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
+        nn.init.xavier_uniform_(self.w_down)
+        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
+        nn.init.xavier_uniform_(self.w_up)
+        
+        self.hidden_dim = hidden_dim
+        
+        self.mu = nn.Linear(hidden_dim, hidden_dim)
+        self.sigma = nn.Linear(hidden_dim, hidden_dim)
+        nn.init.constant_(self.mu.weight, 0.)
+        nn.init.constant_(self.mu.bias, 0.)
+        nn.init.constant_(self.sigma.weight, 0.)
+        nn.init.constant_(self.sigma.bias, 0.0) 
+        
+        # =======================================================
+        # [MAGMAX]: LƯU STATE BAN ĐẦU ĐỂ TÍNH TASK VECTOR
+        # =======================================================
+        self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
+        self.base_sigma_sd = {k: v.detach().clone() for k, v in self.sigma.state_dict().items()}
+        
+        self.history_tau_mu = []    
+        self.history_tau_sigma = [] 
+        
+        self.noise_scale = nn.Parameter(torch.tensor(0.1))
+        self.last_debug_info = {}
+
+    def update_noise(self):
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
+
+    def unfreeze_task_0(self):
+        for param in self.parameters(): param.requires_grad = True
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
+
+    def unfreeze_incremental(self):
+        self.update_noise()
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
+
+    # =====================================================================
+    # [MAGMAX MERGE LOGIC]
+    # =====================================================================
     def after_task_training(self):
-        """Chụp ảnh lại Layer hiện tại và tiến hành Merge MagMax"""
-        # 1. Snapshot
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        """Tính Task Vector và Merge MagMax"""
+        # 1. Tính Task Vector (Tau = W_current - W_base)
+        tau_mu = {k: self.mu.state_dict()[k].detach().cpu() - self.base_mu_sd[k].cpu() for k in self.base_mu_sd.keys()}
+        tau_sigma = {k: self.sigma.state_dict()[k].detach().cpu() - self.base_sigma_sd[k].cpu() for k in self.base_sigma_sd.keys()}
         
-        self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
+        self.history_tau_mu.append(tau_mu)
+        self.history_tau_sigma.append(tau_sigma)
         
-        # 2. MagMax Merge
+        # 2. Hợp nhất
         self._perform_magmax_merge()
-
     def _perform_magmax_merge(self):
-        if not self.history_mu: return
+        if not self.history_tau_mu: return
 
-        def get_merged_state(history_list):
-            keys = history_list[0].keys()
+        def get_merged_state(base_sd, history_tau):
+            keys = base_sd.keys()
             merged_dict = {}
             for key in keys:
-                stacked = torch.stack([d[key] for d in history_list], dim=0)
-                magnitudes = torch.abs(stacked)
+                stacked_tau = torch.stack([d[key] for d in history_tau], dim=0)
+                magnitudes = torch.abs(stacked_tau)
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_param = torch.gather(stacked, 0, max_indices).squeeze(0)
-                merged_dict[key] = best_param.to(self.w_down.device)
+                best_tau = torch.gather(stacked_tau, 0, max_indices).squeeze(0)
+                
+                # W_final = W_base + Tau_merged
+                merged_dict[key] = base_sd[key].to(self.w_down.device) + best_tau.to(self.w_down.device)
             return merged_dict
 
-        self.mu.load_state_dict(get_merged_state(self.history_mu))
-        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
+        self.mu.load_state_dict(get_merged_state(self.base_mu_sd, self.history_tau_mu))
+        self.sigma.load_state_dict(get_merged_state(self.base_sigma_sd, self.history_tau_sigma))
 
     # =====================================================================
     # [FORWARD LOGIC & VIB]
     # =====================================================================
     def forward(self, hyper_features, return_kl=False):
-        # 1. Down Projection
         x_down = hyper_features @ self.w_down
-        
-        # 2. Variational Encoding
+     
+            
         mu = self.mu(x_down)
-        # Ép Float32 và dùng softplus để đảm bảo sigma luôn dương
-        sigma = F.softplus(self.sigma(x_down).float()) + 1e-4 
-        
+        sigma = F.softplus(self.sigma(x_down).float()) + 1e-4
         if self.training:
             epsilon = torch.randn_like(sigma)
             z = mu + sigma * epsilon
