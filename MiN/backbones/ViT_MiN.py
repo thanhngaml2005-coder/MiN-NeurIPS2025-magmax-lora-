@@ -73,7 +73,8 @@ from torch import nn
 from torch.nn import functional as F
 import gc
 
-def __init__(self, in_dim, out_dim, hidden_dim=192):
+class PiNoise(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
         
         self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
