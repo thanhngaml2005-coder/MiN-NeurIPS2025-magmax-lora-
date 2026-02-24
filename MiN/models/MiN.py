@@ -325,6 +325,18 @@ class MinNet(object):
         else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
+        if self.cur_task ==0 or self.cur_task == 1:
+            print("\n" + "="*50)
+            print("🔍 NHỮNG THAM SỐ ĐANG ĐƯỢC TRAIN TRONG EPOCH NÀY:")
+            print("="*50)
+            trainable_params_count = 0
+            for name, param in self._network.named_parameters():
+                if param.requires_grad:
+                    print(f"✅ Đang train: {name} | Kích thước: {list(param.shape)}")
+                    trainable_params_count += param.numel()
+            print(f"🔥 Tổng số lượng tham số đang học: {trainable_params_count:,}")
+            print("="*50 + "\n")
+            
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
