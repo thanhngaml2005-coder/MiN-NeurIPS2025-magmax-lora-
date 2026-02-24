@@ -51,6 +51,15 @@ class MinNet(object):
         self.total_acc = []
         self.class_acc = []
         self.task_acc = []
+        self.old_noise_weights = []
+    def _snapshot_local_weights(self):
+        """Chụp ảnh lại trọng số để tính Ortho Loss cho task sau"""
+        self.old_noise_weights = []
+        for block in self._network.backbone.noise_maker:
+            self.old_noise_weights.append({
+                'mu': block.mu[-1].weight.detach().clone(),      # Trọng số của task vừa học xong
+                'sigma': block.sigmma[-1].weight.detach().clone() 
+            })
 
     def after_train(self, data_manger):
         if self.cur_task == 0:
@@ -122,6 +131,7 @@ class MinNet(object):
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
         self.run(train_loader)
+        self._snapshot_local_weights()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -178,6 +188,7 @@ class MinNet(object):
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
         self.run(train_loader)
+        self._snapshot_local_weights()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
 
