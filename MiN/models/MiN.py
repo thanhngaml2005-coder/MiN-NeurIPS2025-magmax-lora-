@@ -135,6 +135,8 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
+        for block in self._network.backbone.noise_maker:
+            block.after_task_training()
         self._network.collect_projections(mode='threshold', val=0.95)
         
         
@@ -201,6 +203,8 @@ class MinNet(object):
         
         self._clear_gpu()
         self.run(train_loader_sgd)
+        for block in self._network.backbone.noise_maker:
+            block.after_task_training()
         
         # Thu thập GPM Projection sau khi train xong noise
         self._network.collect_projections(mode='threshold', val=0.95)
