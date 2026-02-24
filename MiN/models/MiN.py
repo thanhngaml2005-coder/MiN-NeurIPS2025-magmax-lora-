@@ -308,8 +308,8 @@ class MinNet(object):
                             batch_ortho += torch.mean(torch.matmul(w_sigma_curr, w_sigma_old.t()).pow(2))
 
                     # 4. Total Loss
-                    loss = ce_loss + beta_current * batch_kl + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 else 0.0)
-
+                    # loss = ce_loss + beta_current * batch_kl + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 else 0.0)
+                    loss = ce_loss + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 and torch.is_tensor(batch_ortho) else 0.0)
                 # [NEW] BACKWARD BẰNG SCALER
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
