@@ -235,6 +235,7 @@ class MinNet(object):
             prog_bar.set_description(info)
 
     def run(self, train_loader):
+        # ... (Khúc đầu giữ nguyên) ...
         if self.cur_task == 0:
             epochs = self.init_epochs
             lr = self.init_lr
@@ -244,15 +245,11 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
+        for param in self._network.parameters(): param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): param.requires_grad = True
             
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
+        if self.cur_task == 0: self._network.init_unfreeze()
+        else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
@@ -262,14 +259,15 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
         
-        LAMBDA_ORTHO = 100.0  # Chỉnh Ortho mượt, không bị nổ Loss
-        max_beta = 1e-4 
+        LAMBDA_ORTHO = 100.0  
+        max_beta = 1e-4
+
+        # [NEW] GỌI LẠI SCALER ĐỂ TĂNG TỐC
+        from torch.amp import autocast, GradScaler
+        scaler = GradScaler('cuda')
 
         for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            ce_losses = 0.0
-            kl_losses = 0.0
-            ortho_losses = 0.0
+            losses, ce_losses, kl_losses, ortho_losses = 0.0, 0.0, 0.0, 0.0
             correct, total = 0, 0
             
             beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
@@ -279,42 +277,44 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True)
                 
-                # 1. Forward với KL Loss
-                if self.cur_task > 0:
-                    with torch.no_grad():
-                        outputs1 = self._network(inputs, new_forward=False)
-                        logits1 = outputs1['logits']
-                    logits2, batch_kl = self._network.forward_with_ib(inputs)
-                    logits_final = logits2 + logits1
-                else:
-                    logits_final, batch_kl = self._network.forward_with_ib(inputs)
+                # [NEW] MANG AUTOCAST TRỞ LẠI (TĂNG TỐC x2)
+                with autocast('cuda'):
+                    # 1. Forward với IB (Sinh KL Loss)
+                    if self.cur_task > 0:
+                        with torch.no_grad():
+                            outputs1 = self._network(inputs, new_forward=False)
+                            logits1 = outputs1['logits']
+                        logits2, batch_kl = self._network.forward_with_ib(inputs)
+                        logits_final = logits2 + logits1
+                    else:
+                        logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                # 2. Tính CE Loss
-                ce_loss = F.cross_entropy(logits_final, targets.long())
-                
-                # 3. Tính Ortho Loss (So sánh module [-1] với module [0:k])
-                batch_ortho = 0.0
-                if self.cur_task > 0:
-                    for block in self._network.backbone.noise_maker:
-                        # Trọng số hiện tại đang học
-                        curr_mu = block.mu[-1].weight.float()
-                        curr_sigma = block.sigmma[-1].weight.float()
-                        
-                        # So sánh trực tiếp với tất cả module trước đó trong ModuleList
-                        for task_idx in range(len(block.mu) - 1):
-                            old_mu = block.mu[task_idx].weight.detach().float()
-                            old_sigma = block.sigmma[task_idx].weight.detach().float()
+                    # 2. CE Loss
+                    ce_loss = F.cross_entropy(logits_final, targets.long())
+                    
+                    # 3. Ortho Loss (Tối ưu ép kiểu)
+                    batch_ortho = 0.0
+                    if self.cur_task > 0 and len(self.old_noise_weights) > 0:
+                        for idx, block in enumerate(self._network.backbone.noise_maker):
+                            old_dict = self.old_noise_weights[idx]
                             
-                            batch_ortho += torch.mean(torch.matmul(curr_mu, old_mu.t()).pow(2))
-                            batch_ortho += torch.mean(torch.matmul(curr_sigma, old_sigma.t()).pow(2))
+                            # Tính trực tiếp không cần to().float() thừa thãi vì snapshot đã làm rồi
+                            w_mu_curr = block.mu.weight
+                            w_mu_old = old_dict['mu']
+                            batch_ortho += torch.mean(torch.matmul(w_mu_curr, w_mu_old.t()).pow(2))
                             
-                # 4. Gom tổng Loss
-                loss = ce_loss + beta_current * batch_kl + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 else 0.0)
+                            w_sigma_curr = block.sigma.weight
+                            w_sigma_old = old_dict['sigma']
+                            batch_ortho += torch.mean(torch.matmul(w_sigma_curr, w_sigma_old.t()).pow(2))
 
-                loss.backward()
-                optimizer.step()
+                    # 4. Total Loss
+                    loss = ce_loss + beta_current * batch_kl + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 else 0.0)
+
+                # [NEW] BACKWARD BẰNG SCALER
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
-                # 5. Track Loss
                 losses += loss.item()
                 ce_losses += ce_loss.item()
                 kl_losses += batch_kl.item()
@@ -330,19 +330,19 @@ class MinNet(object):
 
             if self.cur_task > 0:
                 info = "Task {} | Ep {}/{} | L {:.3f} (CE {:.3f} | KL {:.1f} | Ortho {:.4f}) | Acc {:.2f}".format(
-                    self.cur_task, epoch + 1, epochs, 
-                    losses / len(train_loader), ce_losses / len(train_loader), 
-                    kl_losses / len(train_loader), ortho_losses / len(train_loader), train_acc
+                    self.cur_task, epoch + 1, epochs, losses / len(train_loader), 
+                    ce_losses / len(train_loader), kl_losses / len(train_loader), 
+                    ortho_losses / len(train_loader), train_acc
                 )
             else:
                 info = "Task {} | Ep {}/{} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
-                    self.cur_task, epoch + 1, epochs, 
-                    losses / len(train_loader), ce_losses / len(train_loader), 
-                    kl_losses / len(train_loader), train_acc
+                    self.cur_task, epoch + 1, epochs, losses / len(train_loader), 
+                    ce_losses / len(train_loader), kl_losses / len(train_loader), train_acc
                 )
                 
             self.logger.info(info)
             prog_bar.set_description(info)
+    
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
