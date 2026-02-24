@@ -126,61 +126,6 @@ def __init__(self, in_dim, out_dim, hidden_dim=192):
     # =====================================================================
     # [MAGMAX CORE LOGIC]
     # =====================================================================
-    À, ra là bác quyết định "trảm" luôn thằng GPM cho rảnh nợ!
-
-Thực ra quyết định này của bác rất hợp lý. GPM (Gradient Projection Memory) tính toán ma trận SVD cồng kềnh, tốn thời gian và đôi khi làm mạng học rất chậm. Khi bác đã có VIB (tạo nút thắt thông tin) kết hợp với MagMax (bảo vệ Task Vector lớn nhất) thì hệ thống đã có đủ giáp để chống Catastrophic Forgetting rồi. Lược bỏ GPM đi code sẽ siêu sạch và chạy nhanh như gió!
-
-Vậy tôi dọn sạch bóng dáng của GPM khỏi 3 file luôn cho bác nhé. Bác chỉ việc copy đè vào là xong:
-
-1. File Vit_min.py (Xóa sạch GPM, chỉ giữ VIB + MagMax)
-Python
-import torch
-from torch import nn
-from torch.nn import functional as F
-
-class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=192):
-        super(PiNoise, self).__init__()
-        
-        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.w_down)
-        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        nn.init.xavier_uniform_(self.w_up)
-        
-        self.hidden_dim = hidden_dim
-        
-        self.mu = nn.Linear(hidden_dim, hidden_dim)
-        self.sigma = nn.Linear(hidden_dim, hidden_dim)
-        nn.init.constant_(self.mu.weight, 0.)
-        nn.init.constant_(self.mu.bias, 0.)
-        nn.init.constant_(self.sigma.weight, 0.)
-        nn.init.constant_(self.sigma.bias, 0.0) 
-        
-        # =======================================================
-        # [MAGMAX]: LƯU STATE BAN ĐẦU ĐỂ TÍNH TASK VECTOR
-        # =======================================================
-        self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
-        self.base_sigma_sd = {k: v.detach().clone() for k, v in self.sigma.state_dict().items()}
-        
-        self.history_tau_mu = []    
-        self.history_tau_sigma = [] 
-        
-        self.noise_scale = nn.Parameter(torch.tensor(0.1))
-        self.last_debug_info = {}
-
-    def update_noise(self):
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
-
-    def unfreeze_task_0(self):
-        for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
-    def unfreeze_incremental(self):
-        self.update_noise()
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
 
     # =====================================================================
     # [MAGMAX MERGE LOGIC]
